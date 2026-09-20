@@ -41,6 +41,9 @@ python -m analysis.run_analysis \
   --output /path/to/existing/cmt_run/analysis_figures
 ```
 
+You can also run `python run_analysis.py --input ... --output ...` from the
+`analysis/` directory.
+
 If the run contains only the original `token_score_stats/step-*.json`, this creates `score_distributions.png/.pdf` and `score_correlations.csv`. It pairs `gain`, `successor_excess`, `sequential_gain`, and optional `w` samples only when their counts equal `metrics.jsonl`'s `num_valid_tokens` for that step. This verifies that finite-value filtering has not shifted the shared sample indices. Original score-stat files do **not** retain token identity, position, or before/after measurements, so the command does not invent learning-progress plots.
 
 ## Future analysis-enabled training (optional)

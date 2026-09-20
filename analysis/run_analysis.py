@@ -10,7 +10,11 @@ from pathlib import Path
 
 import numpy as np
 
-from .metrics import PREDICTORS, conditional_d_comparison, correlations, quantile_curve
+if __package__:
+    from .metrics import PREDICTORS, conditional_d_comparison, correlations, quantile_curve
+else:
+    # Also support `python run_analysis.py` from inside the analysis directory.
+    from metrics import PREDICTORS, conditional_d_comparison, correlations, quantile_curve
 
 
 def _read_rows(directory: Path) -> list[dict]:
