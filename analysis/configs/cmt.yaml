@@ -7,9 +7,20 @@ analysis:
   save_token_statistics: true
   save_every_n_steps: 100
   measure_learning_progress: true
-  learning_progress_every_n_steps: 100
-  num_sequences_to_track: 2
-  num_tokens_per_sequence: 8
+  learning_progress_every_n_steps: 25
+  num_sequences_to_track: 4
+  num_tokens_per_sequence: 16
   max_probe_response_position: 512
   downstream_window_tokens: 32
   save_full_logits: false
+  qualitative:
+    enabled: true
+    candidate_top_k: 8
+    max_candidates: 40
+    context_tokens: 20
+    prefix_tokens: 128
+    reference_chars: 4000
+    rank_top_k: 5
+    tensorboard_examples: 4
+    direction_tolerance: 1.0e-6
+    future_horizons: [1, 4, 8, 16]

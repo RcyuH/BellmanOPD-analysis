@@ -201,6 +201,17 @@ analysis:
   max_probe_response_position: 512
   downstream_window_tokens: 32
   save_full_logits: false
+  qualitative:
+    enabled: false
+    candidate_top_k: 8
+    max_candidates: 40
+    context_tokens: 20
+    prefix_tokens: 128
+    reference_chars: 4000
+    rank_top_k: 5
+    tensorboard_examples: 4
+    direction_tolerance: 1.0e-6
+    future_horizons: [1, 4, 8, 16]
 
 # By default, evaluation runs at step 0, every 50 optimizer steps, and the final
 # step. vLLM uses a short-lived subprocess so its engine memory is returned

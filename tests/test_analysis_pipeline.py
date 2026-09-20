@@ -11,6 +11,7 @@ import torch
 from analysis.metrics import conditional_d_comparison, correlations, quantile_curve
 from analysis.pipeline import AnalysisLogger
 from analysis.run_analysis import _legacy_score_samples
+from analysis.visualize_token_examples import load_records, mine_examples, render_report
 from b200_experiment.selectors.cmt_selector import CMTSelector
 from b200_experiment.selectors.pgt_selector import PGTOutput
 from b200_experiment.scoring import RolloutBatch
@@ -42,6 +43,17 @@ class _ToyStudent(torch.nn.Module):
 
     def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False, return_dict=True):
         return SimpleNamespace(logits=self.projection(self.embedding(input_ids)))
+
+
+class _ToyTokenizer:
+    all_special_ids = [0]
+
+    def convert_ids_to_tokens(self, token_id):
+        return f"tok_{token_id}"
+
+    def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+        pieces = [f"<{token_id}>" if token_id == 0 else f" token{token_id}" for token_id in token_ids]
+        return "".join(pieces)
 
 
 def test_cmt_globalization_preserves_support_needed_by_progress_probe():
@@ -141,7 +153,13 @@ def test_analysis_keeps_token_identity_and_measures_same_prefix_before_after():
             "num_sequences_to_track": 1,
             "num_tokens_per_sequence": 3,
             "max_probe_response_position": 3,
-        }, _SingleRank())
+            "qualitative": {
+                "enabled": True,
+                "candidate_top_k": 2,
+                "context_tokens": 2,
+                "future_horizons": [1, 2],
+            },
+        }, _SingleRank(), tokenizer=_ToyTokenizer())
         session = logger.begin_rollout(
             scoring_step=1,
             first_optimizer_step=1,
@@ -152,6 +170,7 @@ def test_analysis_keeps_token_identity_and_measures_same_prefix_before_after():
             objective_valid=rollout.valid_mask,
             sample_ids=["problem-1::response-0"],
             dataset_indices=[12],
+            reference_texts=["reference answer"],
             temperature=1.0,
         )
         session.before_optimizer_step(1, model, torch.tensor([0]), rollout.valid_mask, torch.tensor([[.5, 1., 1.5]]))
@@ -165,8 +184,10 @@ def test_analysis_keeps_token_identity_and_measures_same_prefix_before_after():
         logger.close()
         token_path = Path(temporary) / "analysis/tokens/step-000001.jsonl"
         progress_path = Path(temporary) / "analysis/progress/step-000001.jsonl"
+        qualitative_path = Path(temporary) / "analysis/qualitative/step-000001.jsonl"
         tokens = [json.loads(line) for line in token_path.read_text().splitlines()]
         progress = [json.loads(line) for line in progress_path.read_text().splitlines()]
+        qualitative = [json.loads(line) for line in qualitative_path.read_text().splitlines()]
         assert len(tokens) == len(progress) == 3
         assert all(row["sample_id"] == "problem-1::response-0" for row in tokens)
         assert [row["training_weight"] for row in tokens] == [.5, 1., 1.5]
@@ -179,6 +200,24 @@ def test_analysis_keeps_token_identity_and_measures_same_prefix_before_after():
         assert all(abs(row["delta_kl"] - (row["kl_support_reverse_before"] - row["kl_support_reverse_after"])) < 1e-7 for row in progress)
         assert sum(row["delta_future_kl"] is not None for row in progress) == 2
         assert next(row for row in progress if row["response_position"] == 2)["delta_future_kl"] is None
+        assert len(qualitative) == 3
+        assert qualitative[0]["current_token"]["decoded_text"].startswith(" token")
+        assert qualitative[0]["reference_text"] == "reference answer"
+        assert qualitative[0]["candidate_tokens"]
+        assert len(qualitative[0]["student_top_k_before"]) == 2
+        assert len(qualitative[0]["student_top_k_after"]) == 2
+        assert qualitative[0]["teacher_top_k"]
+        assert "rank_g_plus_d" in qualitative[0]
+        assert "delta_future_kl_h1" in qualitative[0]
+
+        loaded, root, legacy = load_records(Path(temporary))
+        assert root == Path(temporary) / "analysis"
+        assert len(loaded) == 3 and not legacy
+        mined = mine_examples(loaded, examples_per_category=2)
+        report = render_report(loaded, mined, source=root, legacy=legacy)
+        assert "Candidate probability movement" in report
+        assert "problem-1::response-0" in report
+        assert "data-g-plus-d" in report
 
 
 def test_analysis_statistics_are_paired_and_conditional():
@@ -269,7 +308,8 @@ def test_analysis_hooks_do_not_change_optimizer_update():
             "measure_learning_progress": True, "learning_progress_every_n_steps": 1,
             "num_sequences_to_track": 1, "num_tokens_per_sequence": 3,
             "max_probe_response_position": 3,
-        }, context)
+            "qualitative": {"enabled": True, "future_horizons": [1, 2]},
+        }, context, tokenizer=_ToyTokenizer())
         session = logger.begin_rollout(
             scoring_step=1, first_optimizer_step=1, rollout=rollout,
             selector=selector, student_scores=sampled, teacher_scores=sampled,

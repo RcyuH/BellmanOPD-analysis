@@ -63,6 +63,7 @@ Raw output under `<experiment.output_dir>/analysis/`:
 manifest.json
 tokens/step-*.jsonl
 progress/step-*.jsonl
+qualitative/step-*.jsonl
 tensorboard/events.out.tfevents.*
 ```
 
@@ -73,6 +74,71 @@ tensorboard --logdir /path/to/cmt_run/analysis/tensorboard
 ```
 
 It shows sampled means/std/min/max and histograms for `g`, `x`, `d`, combined scores, NLL, support KL, entropy, and realized deltas, plus Pearson/Spearman correlations between each predictor and each delta. Existing training TensorBoard logs remain separate.
+
+With `analysis.qualitative.enabled: true`, TensorBoard also receives a small
+text sample under `Analysis/examples/high_D`,
+`Analysis/examples/same_g_different_D`,
+`Analysis/examples/g_vs_gD_ranking_change`, and
+`Analysis/examples/failure_cases`. The JSONL and HTML report remain the main
+interfaces because TensorBoard text is intentionally bounded.
+
+## Qualitative token report
+
+The supplied CMT overlay enables qualitative logging. It decodes tokens with
+the exact tokenizer loaded by training and retains both the raw token ID and
+tokenizer piece. Whitespace is left untouched in JSON; the HTML renders spaces,
+newlines, and tabs with visible markers.
+
+For each sampled before/after probe, `qualitative/step-*.jsonl` stores:
+
+| Field | Meaning |
+|---|---|
+| `prefix_tail_text`, `context_window`, `current_token` | Up to `prefix_tokens` tokens before the position, a ±`context_tokens` response window, and the selected token. Special-token status and raw IDs are retained. |
+| `reference_text` | Dataset answer/solution when one of the repository's known answer fields exists. It is evidence from the dataset, not a generated teacher continuation. |
+| `student_top_k_before`, `student_top_k_after` | Actual full-vocabulary student Top-K at each probe instant. These lists can differ after the update. |
+| `teacher_top_k` | Teacher-leading tokens inside the rollout-time selector union; probabilities are reconstructed from its conditional probabilities and retained support mass. |
+| `candidate_tokens` | Informative paired candidates from the fixed rollout-time union of student/teacher Top-K actions plus the sampled target. Each has full-vocabulary student probability/log-probability before and after, reconstructed teacher probability, conditional-on-union probabilities, within-set ranks, `delta_p`, and `delta_rank`. A token that enters only the after-update full-vocabulary Top-K appears in `student_top_k_after`, but has no invented before/after pair outside this fixed set. |
+| `teacher_preferred_token` | Highest teacher-probability token inside the stored candidate set. This need not be the global teacher argmax if the selector support was configured differently. |
+| `target_logprob_gain` | `log p_after(y_t) - log p_before(y_t)`; positive means the sampled token became more likely. It equals `delta_nll`. |
+| `local_reverse_kl_gain` / `delta_kl` | `KL(p_U || q_U)_before - KL(p_U || q_U)_after`; positive means the student moved closer under this fixed-support reverse KL. This is not `KL(q || p)` over the full vocabulary. |
+| `teacher_preferred_probability_gain` | Change in student probability assigned to the teacher's highest-probability stored candidate. |
+| `delta_future_kl_h1/h4/h8/h16` | Mean fixed-support reverse-KL decrease over the next observed 1/4/8/16 valid tokens. A terminal position has `null`. |
+| `rank_g`, `rank_g_plus_x`, `rank_g_plus_d` | One-based rank of this position among valid positions in the same response under each counterfactual score. `top_positions_*` stores the configured leading positions. These are diagnostic rankings; they do not rerun allocation or optimization. |
+| `observed_update_scope` | Reminder that before/after changes follow the whole PPO minibatch update, not an isolated update at the displayed token. |
+
+Generate the self-contained report after training or after a resumed segment:
+
+```bash
+python -m analysis.visualize_token_examples \
+  --input /path/to/cmt_run \
+  --output /path/to/cmt_run/analysis/token_report \
+  --examples-per-category 5
+```
+
+Open `token_report/token_examples.html`. The page includes a switchable
+`g`/`X`/`D`/`g+X`/`g+D` token heatmap, before/after candidate tables,
+counterfactual sequence rankings, dataset references, local outcomes, and
+future outcomes. It mines high `g`, high `D`, high-`g`/low-`D`,
+moderate-`g`/high-`D`, ranking changes, positive and negative downstream
+changes, failures, and pairs with similar `g` (or similar `g` and `X`) but
+different `D`. Thresholds are configurable:
+
+```bash
+python -m analysis.visualize_token_examples \
+  --input /path/to/cmt_run/analysis \
+  --output /path/to/report.html \
+  --similar-g-relative-tolerance 0.05 \
+  --similar-g-absolute-tolerance 1e-6 \
+  --minimum-d-gap 0.1
+```
+
+The command also writes `mined_examples.json`. If only older `progress/` logs
+exist, it creates a scalar-only report and explicitly marks decoded context,
+candidate distributions, and sequence ranks as unavailable; these values
+cannot be reconstructed from the old compact records. It joins a token ID from
+`tokens/` when the independently sampled coordinates happen to match. Pass
+`--tokenizer /local/path/to/the/training-tokenizer` to decode those matched IDs;
+this still cannot recover the missing prefix or before/after candidate set.
 
 ## Offline plots for an instrumented run
 
@@ -90,4 +156,7 @@ The command writes PNG/PDF figures for score distributions, normalized-position 
 - Only CMT is supported, because other training methods do not define this exact `g/X/D` triplet. Enabling analysis for another method raises an error.
 - Scoring and token sampling are detached. The actual OPD objective, Gibbs allocator, backward pass, optimizer, and checkpoints are unchanged. The extra model forwards run only on the configured progress interval and never backpropagate.
 - Resume rewinds analysis token/progress files after the resume checkpoint step, matching the run's training history. Raw files are bounded by the configured number of sequences and positions.
+- Qualitative mode adds no backward pass and saves no full-vocabulary tensor. It reuses the scheduled before/after probe and stores at most `max_candidates` decoded candidates per selected position. Candidate ranks therefore refer to the retained support, not the entire vocabulary.
+- The report's “good/worse” wording uses only measured teacher-alignment signals: local/future fixed-support KL change, sampled-target log-probability gain, and teacher-preferred-candidate probability gain. It does not judge prose by a text heuristic.
+- Short before/after generations are not emitted. Producing a true “before” continuation after the optimizer step would require retaining or cloning a model state and would materially raise storage/runtime. Candidate probability movement gives a deterministic local comparison without that intervention.
 - This pipeline does not establish that teaching a specific token caused downstream access to change. That claim requires a separate intervention or branching-inference experiment; a full-budget performance sweep also requires already trained comparison runs or additional training.

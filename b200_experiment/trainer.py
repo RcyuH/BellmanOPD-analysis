@@ -3497,6 +3497,7 @@ def run_training(
             output_dir,
             {"seed": seed, **dict(config.get("analysis", {}))},
             distributed,
+            tokenizer=tokenizer,
             resume_step=resume_step,
         )
         if bool(config.get("analysis", {}).get("enabled", False))
@@ -4133,6 +4134,12 @@ def run_training(
                 batch_records, indices, response_indices
             )
         ]
+        reference_texts = []
+        for record in batch_records:
+            reference = _grpo_answer_value(
+                record, str(config.get("grpo", {}).get("answer_key", "answer"))
+            )
+            reference_texts.append(None if reference is None else str(reference))
         analysis_session = (
             analysis_logger.begin_rollout(
                 scoring_step=rollout_last_optimizer_step,
@@ -4144,6 +4151,7 @@ def run_training(
                 objective_valid=objective_valid,
                 sample_ids=sample_ids,
                 dataset_indices=indices,
+                reference_texts=reference_texts,
                 temperature=float(config["rollout"].get("temperature", 1.0)),
             )
             if analysis_logger is not None
