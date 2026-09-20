@@ -1,0 +1,46 @@
+_base_: ../../configs/qwen3_b200_opd.yaml
+
+# Exact causal token intervention. This is intentionally a separate runner;
+# it does not enable the observational CMT hooks in analysis/pipeline.py.
+experiment:
+  method: opd
+  require_b200: true
+
+# Full Competition-MATH train split; no training subset is configured.
+data:
+  path: nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet
+  split: null
+  prompt_key: problem
+  prefer_source_prompt: false
+  # "Full train split" is a hard invariant for this experiment. A long row
+  # must stop the run instead of being silently filtered or truncated.
+  max_prompt_tokens: 4096
+  overlong_prompt_policy: error
+
+prompt_token_influence:
+  enabled: true
+  output_dir: outputs/prompt_token_influence
+  # The launcher starts eight replicated workers. Override to 1 only for a
+  # deliberate one-GPU smoke test launched without the default shell wrapper.
+  expected_world_size: 8
+  benchmark: Competition-MATH
+  epochs: 1
+  max_steps: null
+  train_batch_size: 1
+  learning_rate: 5.0e-6
+  actual_update: uniform_mean
+  distance: full_vocab_teacher_to_student_kl
+  distance_student_temperature: 1.0
+  distance_teacher_temperature: 1.0
+  distance_vocab_chunk_positions: 32
+  max_eval_prompt_tokens: 2048
+  checkpoint_interval: 100
+
+# The standalone intervention runner does not generate responses or launch
+# periodic correctness evaluation. These flags avoid suggesting otherwise in
+# the resolved experiment configuration.
+training_evaluation:
+  enabled: false
+
+analysis:
+  enabled: false
