@@ -1,0 +1,24 @@
+_base_: qwen3_b200_base.yaml
+
+experiment:
+  method: opd
+  output_dir: outputs/opd
+
+rollout:
+  num_responses: 4
+  max_new_tokens: 4096
+  vllm:
+    gpu_memory_utilization: 0.60
+    max_num_seqs: 64
+    max_model_len: 5200
+    max_concurrent_requests: 64
+
+training:
+  epochs: 3
+  micro_batch_size_per_gpu: 16
+  ppo_mini_batch_size: 64
+  learning_rate: 5.0e-6
+  save_interval: 150
+
+training_evaluation:
+  interval_steps: 150

@@ -1,0 +1,19 @@
+# Shared ablation overlay. The launcher supplies model/data paths and scalar
+# overrides from environment variables.
+experiment:
+  method: cmt
+selector:
+  cmt_ablation_arm: canonical
+  cmt_allocation_kl: 0.5
+  cmt_gamma: 1.0
+  cmt_successor_lambda: 1.0
+  top_k: 16
+rollout:
+  max_new_tokens: 4096
+  temperature: 1.0
+  top_p: 1.0
+training:
+  learning_rate: 1.0e-6
+training_evaluation:
+  enabled: true
+  max_new_tokens: 7168

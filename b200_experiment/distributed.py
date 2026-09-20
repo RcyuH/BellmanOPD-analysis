@@ -1,0 +1,435 @@
+from __future__ import annotations
+
+import math
+import os
+import socket
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+import torch
+import torch.distributed as dist
+
+
+_DISTRIBUTED_LAUNCH_ENVIRONMENT = frozenset(
+    {
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "GROUP_RANK",
+        "GROUP_WORLD_SIZE",
+        "ROLE_RANK",
+        "ROLE_WORLD_SIZE",
+        "ROLE_NAME",
+        "NODE_RANK",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+    }
+)
+
+
+def isolate_distributed_subprocess_environment(
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Remove the parent launcher's identity from a standalone child process.
+
+    In particular, torchrun exports ``TORCHELASTIC_USE_AGENT_STORE=True``.
+    In affected PyTorch versions this makes *every* rank created through a
+    ``tcp://`` rendezvous a TCPStore client.  vLLM 0.17.1 uses such a rendezvous
+    for its own internal process group, whose rank 0 must instead host that new
+    store.  Passing the torchrun flag to vLLM therefore leaves no store server
+    and blocks startup until the ten-minute TCP timeout.
+
+    Strip all torchrun rank/rendezvous fields and every TORCHELASTIC field, not
+    only the currently documented subset, so descendants of the child remain
+    independent from the trainer process group.
+    """
+    isolated = dict(os.environ if environment is None else environment)
+    for name in tuple(isolated):
+        if name in _DISTRIBUTED_LAUNCH_ENVIRONMENT or name.startswith("TORCHELASTIC_"):
+            isolated.pop(name)
+    return isolated
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    """Small, explicit wrapper around single-node distributed state."""
+
+    rank: int
+    local_rank: int
+    world_size: int
+    device: torch.device
+
+    @property
+    def enabled(self) -> bool:
+        return self.world_size > 1
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
+
+    def barrier(self) -> None:
+        if self.enabled:
+            if self.device.type == "cuda":
+                dist.barrier(device_ids=[self.device.index])
+            else:
+                dist.barrier()
+
+    def sum_int(self, value: int) -> int:
+        tensor = torch.tensor(value, dtype=torch.int64, device=self.device)
+        if self.enabled:
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return int(tensor.item())
+
+    def sum_float(self, value: float) -> float:
+        tensor = torch.tensor(value, dtype=torch.float64, device=self.device)
+        if self.enabled:
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return float(tensor.item())
+
+    def mean_float(self, value: float) -> float:
+        return self.sum_float(value) / self.world_size
+
+    def max_float(self, value: float) -> float:
+        tensor = torch.tensor(value, dtype=torch.float64, device=self.device)
+        if self.enabled:
+            dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+        return float(tensor.item())
+
+    def max_int(self, value: int) -> int:
+        tensor = torch.tensor(value, dtype=torch.int64, device=self.device)
+        if self.enabled:
+            dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+        return int(tensor.item())
+
+    def any(self, value: bool) -> bool:
+        return self.max_int(int(value)) != 0
+
+    def all_gather_objects(self, value):
+        if not self.enabled:
+            return [value]
+        gathered = [None for _ in range(self.world_size)]
+        dist.all_gather_object(gathered, value)
+        return gathered
+
+    def broadcast_object(self, value, source: int = 0):
+        if not self.enabled:
+            return value
+        values = [value if self.rank == source else None]
+        dist.broadcast_object_list(values, src=source, device=self.device)
+        return values[0]
+
+    def all_gather_variable_1d(
+        self, values: torch.Tensor
+    ) -> tuple[torch.Tensor, int, int, tuple[int, ...]]:
+        """Gather a variable-length 1-D CUDA tensor on every worker.
+
+        Rank order is retained. With contiguous batch partitioning this is also
+        the original global sample/response-position order, which makes stable
+        top-budget tie breaking invariant to the number of workers.
+        """
+        values = values.contiguous().reshape(-1)
+        if not self.enabled:
+            return values, 0, values.numel(), (values.numel(),)
+        local_length = torch.tensor(
+            [values.numel()], dtype=torch.int64, device=self.device
+        )
+        gathered_lengths = [
+            torch.zeros_like(local_length) for _ in range(self.world_size)
+        ]
+        dist.all_gather(gathered_lengths, local_length)
+        lengths = tuple(int(item.item()) for item in gathered_lengths)
+        maximum = max(lengths, default=0)
+        if maximum == 0:
+            empty = values.new_empty((0,))
+            return empty, 0, 0, lengths
+        padded = values.new_zeros((maximum,))
+        if values.numel():
+            padded[: values.numel()] = values
+        gathered = [torch.empty_like(padded) for _ in range(self.world_size)]
+        dist.all_gather(gathered, padded)
+        combined = torch.cat(
+            [tensor[:length] for tensor, length in zip(gathered, lengths)], dim=0
+        )
+        start = sum(lengths[: self.rank])
+        return combined, start, start + lengths[self.rank], lengths
+
+    def close(self) -> None:
+        if self.enabled and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def initialize_distributed(backend: str = "nccl") -> DistributedContext:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size <= 0:
+        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"RANK={rank} is invalid for WORLD_SIZE={world_size}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("B200 training requires CUDA")
+    if local_rank >= torch.cuda.device_count():
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank}, but only {torch.cuda.device_count()} CUDA "
+            "devices are visible"
+        )
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    if world_size > 1 and not dist.is_initialized():
+        kwargs = {"backend": backend, "init_method": "env://"}
+        if backend == "nccl":
+            # Bind this process group to the already selected local GPU.  This
+            # prevents NCCL from guessing a device from the global rank and
+            # removes the barrier warning seen under torchrun.
+            kwargs["device_id"] = device
+        dist.init_process_group(**kwargs)
+    return DistributedContext(rank, local_rank, world_size, device)
+
+
+def contiguous_partition(total: int, rank: int, world_size: int) -> tuple[int, int]:
+    """Balanced contiguous partition with no padding or repeated examples."""
+    if total < 0 or world_size <= 0 or not 0 <= rank < world_size:
+        raise ValueError(
+            f"Invalid partition arguments: total={total}, rank={rank}, world={world_size}"
+        )
+    quotient, remainder = divmod(total, world_size)
+    start = rank * quotient + min(rank, remainder)
+    length = quotient + int(rank < remainder)
+    return start, start + length
+
+
+@dataclass(frozen=True)
+class BatchLayout:
+    global_prompt_batch_size: int
+    world_size: int
+    local_prompt_batch_size: int
+    num_responses: int
+    global_trajectory_batch_size: int
+    local_trajectory_batch_size: int
+    ppo_mini_batch_size: int
+    local_ppo_mini_batch_size: int
+    optimizer_steps_per_full_rollout: int
+    micro_batch_size_per_gpu: int
+    micro_batches_per_gpu: int
+
+
+def batch_layout(
+    global_prompt_batch_size: int,
+    num_responses: int,
+    world_size: int,
+    micro_batch_size_per_gpu: int,
+    ppo_mini_batch_size: int | None = None,
+) -> BatchLayout:
+    """Resolve explicit global/local batch semantics for one training step."""
+    values = {
+        "global_prompt_batch_size": int(global_prompt_batch_size),
+        "num_responses": int(num_responses),
+        "world_size": int(world_size),
+        "micro_batch_size_per_gpu": int(micro_batch_size_per_gpu),
+    }
+    invalid = {name: value for name, value in values.items() if value <= 0}
+    if invalid:
+        raise ValueError(f"Batch layout values must be positive: {invalid}")
+    local_prompts = (
+        values["global_prompt_batch_size"] + values["world_size"] - 1
+    ) // values["world_size"]
+    global_trajectories = values["global_prompt_batch_size"] * values["num_responses"]
+    ppo_size = (
+        global_trajectories if ppo_mini_batch_size is None else int(ppo_mini_batch_size)
+    )
+    if ppo_size <= 0:
+        raise ValueError("ppo_mini_batch_size must be positive")
+    if ppo_size < values["world_size"]:
+        raise ValueError(
+            "ppo_mini_batch_size must be at least world_size so every rank "
+            "can receive a real trajectory in a complete optimizer step"
+        )
+    local_ppo_size = (ppo_size + values["world_size"] - 1) // values["world_size"]
+    effective_micro = min(values["micro_batch_size_per_gpu"], local_ppo_size)
+    return BatchLayout(
+        global_prompt_batch_size=values["global_prompt_batch_size"],
+        world_size=values["world_size"],
+        local_prompt_batch_size=local_prompts,
+        num_responses=values["num_responses"],
+        global_trajectory_batch_size=global_trajectories,
+        local_trajectory_batch_size=local_prompts * values["num_responses"],
+        ppo_mini_batch_size=ppo_size,
+        local_ppo_mini_batch_size=local_ppo_size,
+        optimizer_steps_per_full_rollout=(global_trajectories + ppo_size - 1)
+        // ppo_size,
+        micro_batch_size_per_gpu=effective_micro,
+        micro_batches_per_gpu=(local_ppo_size + effective_micro - 1) // effective_micro,
+    )
+
+
+def distributed_ppo_minibatch_partition(
+    local_counts: tuple[int, ...] | list[int],
+    rank: int,
+    ppo_mini_batch_size: int,
+    minibatch_index: int,
+) -> tuple[list[int], int]:
+    """Return local rows for one global PPO minibatch.
+
+    Rollout rows are locally owned, so a rank-major contiguous global slice can
+    leave whole PPO minibatches on one rank.  We instead define a deterministic
+    rank-interleaved global order: local row ``j`` from each rank contributes in
+    rank order before local row ``j+1``.  Consequently every complete global
+    minibatch is shared by all ranks, while local row order remains stable.
+
+    The returned indices are positions in the caller's local rollout tensor and
+    ``global_count`` is the number of real trajectories in this minibatch.  A
+    final partial minibatch is supported; callers must reject it only when a
+    rank receives zero rows because collective model execution would otherwise
+    be undefined.
+    """
+    counts = tuple(int(value) for value in local_counts)
+    if not counts or any(value < 0 for value in counts):
+        raise ValueError(
+            "local_counts must be a non-empty sequence of non-negative integers"
+        )
+    world_size = len(counts)
+    if not 0 <= int(rank) < world_size:
+        raise ValueError(f"rank={rank} is invalid for world_size={world_size}")
+    ppo_size = int(ppo_mini_batch_size)
+    if ppo_size <= 0:
+        raise ValueError("ppo_mini_batch_size must be positive")
+    index = int(minibatch_index)
+    if index < 0:
+        raise ValueError("minibatch_index must be non-negative")
+    total = sum(counts)
+    if total <= 0:
+        raise ValueError("local_counts must contain at least one real trajectory")
+    begin = index * ppo_size
+    if begin >= total:
+        raise ValueError(
+            f"minibatch_index={index} is outside {math.ceil(total / ppo_size)} minibatches"
+        )
+    end = min(begin + ppo_size, total)
+    order: list[tuple[int, int]] = []
+    for local_position in range(max(counts)):
+        for owner, count in enumerate(counts):
+            if local_position < count:
+                order.append((owner, local_position))
+    selected = order[begin:end]
+    local_indices = [
+        local_position for owner, local_position in selected if owner == int(rank)
+    ]
+    return local_indices, len(selected)
+
+
+def grouped_ppo_minibatch_partition(
+    group_ids_by_rank: tuple[tuple[int, ...], ...] | list[tuple[int, ...]],
+    rank: int,
+    ppo_mini_batch_size: int,
+    minibatch_index: int,
+) -> tuple[list[int], int]:
+    """Partition one global PPO minibatch in group-major order.
+
+    ``group_ids_by_rank[r][i]`` identifies the rollout/response index of local
+    trajectory ``i`` on rank ``r``.  The global order is stable group-major,
+    then rank-major, then local-row-major.  Thus, when a rollout contains one
+    row for every ``(prompt, response_index)`` pair and the PPO size equals the
+    prompt batch size, each PPO minibatch contains exactly one response from
+    every prompt.
+
+    This helper only defines membership.  It never pads, drops, or repeats a
+    real trajectory; local microbatching remains a later, orthogonal step.
+    """
+    grouped = tuple(
+        tuple(int(value) for value in values) for values in group_ids_by_rank
+    )
+    if not grouped:
+        raise ValueError("group_ids_by_rank must contain at least one rank")
+    world_size = len(grouped)
+    owner_rank = int(rank)
+    if not 0 <= owner_rank < world_size:
+        raise ValueError(f"rank={rank} is invalid for world_size={world_size}")
+    ppo_size = int(ppo_mini_batch_size)
+    if ppo_size <= 0:
+        raise ValueError("ppo_mini_batch_size must be positive")
+    index = int(minibatch_index)
+    if index < 0:
+        raise ValueError("minibatch_index must be non-negative")
+    total = sum(len(values) for values in grouped)
+    if total <= 0:
+        raise ValueError("group_ids_by_rank must contain at least one trajectory")
+
+    # Preserve the first global occurrence of each response index.  With the
+    # prompt-major layout emitted by expand_prompt_batch this is 0, 1, ..., n-1.
+    group_order: list[int] = []
+    seen_groups: set[int] = set()
+    for values in grouped:
+        for value in values:
+            if value not in seen_groups:
+                seen_groups.add(value)
+                group_order.append(value)
+
+    order: list[tuple[int, int]] = []
+    for group_id in group_order:
+        for owner, values in enumerate(grouped):
+            order.extend(
+                (owner, local_position)
+                for local_position, value in enumerate(values)
+                if value == group_id
+            )
+    if len(order) != total:
+        raise AssertionError("Grouped PPO order is not a permutation of trajectories")
+
+    begin = index * ppo_size
+    if begin >= total:
+        raise ValueError(
+            f"minibatch_index={index} is outside {math.ceil(total / ppo_size)} minibatches"
+        )
+    selected = order[begin : min(begin + ppo_size, total)]
+    local_indices = [
+        local_position for owner, local_position in selected if owner == owner_rank
+    ]
+    return local_indices, len(selected)
+
+
+def padded_local_indices(
+    global_indices: list[int], rank: int, world_size: int
+) -> tuple[list[int], list[bool]]:
+    """Return equal-sized rank batches while marking deterministic tail padding.
+
+    Every real index remains present exactly once. At an uneven dataset tail the
+    shorter ranks repeat one local index only to keep FSDP collective schedules
+    identical; callers must exclude entries whose active flag is false from the
+    objective and all scientific metrics.
+    """
+    total = len(global_indices)
+    if total <= 0:
+        raise ValueError("Global batch must contain at least one real prompt")
+    start, end = contiguous_partition(total, rank, world_size)
+    local = list(global_indices[start:end])
+    target = (total + world_size - 1) // world_size
+    active = [True] * len(local)
+    # Empty ranks (possible for a one-sample final tail) use a global sample as
+    # collective-only filler. It remains inactive and contributes nowhere.
+    filler = local[-1] if local else global_indices[-1]
+    while len(local) < target:
+        local.append(filler)
+        active.append(False)
+    return local, active
+
+
+def unique_free_port(context: DistributedContext, attempts: int = 10) -> int:
+    """Choose distinct localhost ports across workers before starting servers."""
+    for _ in range(max(1, attempts)):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handle:
+            handle.bind(("127.0.0.1", 0))
+            port = int(handle.getsockname()[1])
+        if not context.enabled:
+            return port
+        local = torch.tensor([port], dtype=torch.int64, device=context.device)
+        gathered = [torch.zeros_like(local) for _ in range(context.world_size)]
+        dist.all_gather(gathered, local)
+        ports = [int(item.item()) for item in gathered]
+        if len(set(ports)) == context.world_size:
+            return port
+    raise RuntimeError("Could not allocate distinct vLLM server ports across workers")
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model

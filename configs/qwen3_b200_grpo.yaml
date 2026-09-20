@@ -1,0 +1,22 @@
+_base_: qwen3_b200_base.yaml
+
+# Teacher-free Group Relative Policy Optimization (GRPO).
+# The student is sampled G times per prompt; outcome rewards are normalized
+# within each prompt group and optimized with the clipped PPO surrogate.
+experiment:
+  method: grpo
+  output_dir: outputs/grpo
+
+rollout:
+  # G=8 is the canonical practical baseline. Override with NUM_RESPONSES or
+  # GRPO_GROUP_SIZE in scripts/train_grpo_b200.sh.
+  num_responses: 8
+  temperature: 1.0
+  top_p: 1.0
+  vllm:
+    return_log_probs: true
+
+grpo:
+  answer_key: answer
+  reward_benchmark: Competition-MATH
+  advantage_epsilon: 1.0e-8

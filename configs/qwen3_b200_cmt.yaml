@@ -1,0 +1,44 @@
+_base_: qwen3_b200_base.yaml
+
+experiment:
+  method: cmt
+  output_dir: outputs/cmt_opd
+
+# Coupled Marginal Teachability uses the conditional student/teacher Top-K
+# union for local scoring and a raw-mass truncated common-mass kernel for
+# sequential accessibility. Its OPD policy loss remains Student Top-16 only.
+# Exact full-vocabulary reductions are opt-in diagnostics only.
+rollout:
+  num_responses: 4
+  max_new_tokens: 4096
+  vllm:
+    gpu_memory_utilization: 0.60
+    max_num_seqs: 64
+    max_model_len: 5200
+    max_concurrent_requests: 64
+
+training:
+  epochs: 3
+  micro_batch_size_per_gpu: 16
+  ppo_mini_batch_size: 64
+  learning_rate: 5.0e-6
+  save_interval: 150
+
+training_evaluation:
+  interval_steps: 150
+
+selector:
+  joint_cross_scoring: true
+  pgt_vocab_chunk_tokens: 2048
+  # Information budget for max_w <w,L> s.t. KL(w || uniform) <= epsilon.
+  # Weights retain full support and are normalized to mean one within each
+  # global PPO group (one allocation == one optimizer update).
+  cmt_allocation_kl: 0.5
+  # gamma=1 is the primary finite-response estimand: no artificial time
+  # preference.  Lambda exposes (rather than hides) the relative value assigned
+  # to unlocking one unit of downstream local learning opportunity.
+  cmt_gamma: 1.0
+  cmt_successor_lambda: 1.0
+  # Optional full-vocabulary diagnostic only; the training score is support
+  # matched and does not pay this O(B*T*V) reduction by default.
+  cmt_full_vocab_diagnostics: false

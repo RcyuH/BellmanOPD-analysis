@@ -1,0 +1,38 @@
+_base_: qwen3_b200_base.yaml
+
+# Importance-Weighted On-Policy Distillation (YannX1e/IW-OPD).  The trainer
+# uses the sampled response action as a singleton PPO support and applies the
+# official prefix remaining-discrepancy multiplier to the frozen OPD
+# advantage.  All other methods keep their existing configs untouched.
+experiment:
+  method: iw
+  output_dir: outputs/iw
+
+rollout:
+  batch_size: 64
+  num_responses: 1
+  max_new_tokens: 4096
+  vllm:
+    max_model_len: 5120
+    gpu_memory_utilization: 0.6
+
+training:
+  learning_rate: 5.0e-6
+  ppo_mini_batch_size: 16
+  micro_batch_size_per_gpu: 8
+  save_interval: 100
+
+training_evaluation:
+  interval_steps: 100
+  max_new_tokens: 4096
+
+evaluation:
+  max_new_tokens: 4096
+  vllm:
+    max_model_len: 5120
+
+iw_opd:
+  enabled: true
+  weight_max: 1.5
+  use_abs: true
+  eps: 1.0e-8

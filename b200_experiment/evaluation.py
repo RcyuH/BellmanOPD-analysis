@@ -1,0 +1,1063 @@
+from __future__ import annotations
+
+import csv
+import gzip
+import hashlib
+import json
+import math
+import random
+import re
+from pathlib import Path
+from typing import Any
+
+import torch
+from tqdm.auto import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.utils import logging as transformers_logging
+
+from .models import choose_attention_implementation, model_dtype_kwargs
+from .math_prompts import render_math_prompt
+
+transformers_logging.disable_progress_bar()
+
+BENCHMARK_ORDER = (
+    "Competition-MATH",
+    "MATH-500",
+    "AIME24",
+    "AIME25",
+    "GPQA-Diamond",
+    "AMC23",
+)
+EXTENDED_BENCHMARK_SPECS: dict[str, dict[str, Any]] = {
+    "GPQA-Diamond": {
+        "task_type": "gpqa",
+        "path": "nlp/minhpn19/data/GPQA-Diamond/gpqa_diamond.jsonl",
+        "question_key": "prompt",
+        "answer_key": "ground_truth",
+        "choice_shuffle_seed": 1234,
+    },
+    "AMC23": {
+        # AMC23 is a standard exact-answer math benchmark.  Keep the original
+        # parquet probabilities/columns and use the same math renderer and
+        # verifier as the other math benchmarks.
+        "task_type": "math",
+        "path": "nlp/minhpn19/data/amc23/test-00000-of-00001.parquet",
+        "question_key": "question",
+        "answer_key": "answer",
+        "id_key": "id",
+    },
+}
+
+
+def ensure_extended_benchmark_specs(config: dict[str, Any]) -> dict[str, Any]:
+    """Backfill new benchmark specs into old resolved run configurations.
+
+    Checkpoints created before GPQA/AMC23 support have a four-benchmark
+    ``resolved_config.yaml``. Re-evaluation should be able to request the new
+    datasets without rewriting that historical file, so the defaults are
+    materialized in-memory relative to its storage root.
+    """
+    evaluation = config.setdefault("evaluation", {})
+    specs = evaluation.setdefault("benchmarks", {})
+    root = Path(config.get("paths", {}).get("storage_root", "/workspace/storage-shared"))
+    for name, default in EXTENDED_BENCHMARK_SPECS.items():
+        if name in specs:
+            continue
+        spec = json.loads(json.dumps(default))
+        path = Path(spec["path"])
+        spec["path"] = str(path if path.is_absolute() else root / path)
+        specs[name] = spec
+    # Migrate historical resolved configs in memory.  Older runs may have
+    # persisted IFEval in ``benchmark_names``; the benchmark is intentionally
+    # replaced by AMC23 for all future evaluations without rewriting the
+    # checkpoint's immutable resolved_config.yaml.
+    for section_name in ("evaluation", "training_evaluation"):
+        section = config.setdefault(section_name, {})
+        names = section.get("benchmark_names")
+        if isinstance(names, (list, tuple)):
+            section["benchmark_names"] = [
+                "AMC23" if str(name).casefold() == "ifeval" else name
+                for name in names
+            ]
+    return config
+MODEL_ORDER = ("Base", "OPD", "TA-OPD", "RAC", "PGT", "CMT-OPD", "GRPO", "IW-OPD")
+
+
+def configured_benchmark_names(
+    config: dict[str, Any], requested: list[str] | tuple[str, ...] | None = None
+) -> tuple[str, ...]:
+    """Return a validated canonical benchmark subset for this resolved config."""
+    specs = config.get("evaluation", {}).get("benchmarks", {})
+    configured = config.get("evaluation", {}).get("benchmark_names")
+    names = tuple(requested) if requested is not None else tuple(
+        configured
+        if configured is not None
+        else (name for name in BENCHMARK_ORDER if name in specs)
+    )
+    if not names:
+        raise ValueError("Evaluation must configure at least one benchmark")
+    if len(names) != len(set(names)):
+        raise ValueError(f"Evaluation benchmark names contain duplicates: {names}")
+    unknown = set(names) - set(BENCHMARK_ORDER)
+    if unknown:
+        raise ValueError(f"Unknown evaluation benchmarks: {sorted(unknown)}")
+    missing = [name for name in names if name not in specs]
+    if missing:
+        raise ValueError(f"Missing evaluation benchmark configuration for: {missing}")
+    canonical = tuple(name for name in BENCHMARK_ORDER if name in names)
+    if names != canonical:
+        raise ValueError(
+            f"Evaluation benchmarks must follow canonical order {BENCHMARK_ORDER}; "
+            f"got {names}"
+        )
+    return names
+
+
+def evaluation_metric_name(
+    samples_per_problem: int, requested: str | None = None
+) -> str:
+    samples = int(samples_per_problem)
+    if samples <= 0:
+        raise ValueError("Evaluation samples per problem must be positive")
+    if requested is None or str(requested).strip().lower() in {"", "auto"}:
+        return "accuracy" if samples == 1 else f"avg@{samples}"
+    normalized = str(requested).strip().lower()
+    if normalized in {"avg", "average", "avg@k"}:
+        return "accuracy" if samples == 1 else f"avg@{samples}"
+    if normalized in {"pass", "pass@k", "pass_at_k"}:
+        return f"pass@{samples}"
+    if normalized.startswith("avg@"):
+        try:
+            k = int(normalized.split("@", 1)[1])
+        except ValueError as error:
+            raise ValueError(f"Invalid evaluation metric: {requested!r}") from error
+        if k != samples:
+            raise ValueError(
+                f"avg@{k} requires num_responses={k}, got {samples}"
+            )
+        return f"avg@{samples}"
+    if normalized.startswith("pass@"):
+        try:
+            k = int(normalized.split("@", 1)[1])
+        except ValueError as error:
+            raise ValueError(f"Invalid evaluation metric: {requested!r}") from error
+        if k <= 0 or k > samples:
+            raise ValueError(
+                f"pass@{k} requires 1 <= k <= num_responses={samples}"
+            )
+        return f"pass@{k}"
+    if normalized == "accuracy" and samples == 1:
+        return "accuracy"
+    raise ValueError(
+        f"Unsupported evaluation metric {requested!r}; use avg@k or pass@k"
+    )
+
+
+def metric_problem_score(correctness: list[bool], metric_name: str) -> float:
+    """Return one problem's contribution to the selected evaluation metric.
+
+    For pass@k, use the standard unbiased estimator from ``n`` sampled
+    completions.  The requested re-evaluation protocol uses n=k=8, where this
+    reduces exactly to ``1`` iff at least one completion is correct.
+    """
+    if not correctness:
+        return 0.0
+    if not metric_name.startswith("pass@"):
+        return sum(map(int, correctness)) / len(correctness)
+    k = int(metric_name.split("@", 1)[1])
+    n = len(correctness)
+    correct = sum(map(int, correctness))
+    if correct <= 0:
+        return 0.0
+    if k == n:
+        return 1.0
+    return 1.0 - math.comb(n - correct, k) / math.comb(n, k)
+
+
+def detailed_model_output_record(
+    *,
+    model_name: str,
+    model_path: str | Path | None,
+    backend: str,
+    benchmark: str,
+    row: dict[str, str],
+    rendered_prompt: str,
+    responses: list[str],
+    correctness: list[bool],
+    temperature: float,
+    top_p: float,
+    max_new_tokens: int,
+    seed: int,
+) -> dict[str, Any]:
+    """Build one audit-friendly row containing every output for one problem."""
+    if len(responses) != len(correctness):
+        raise ValueError("Detailed responses and correctness flags must align")
+    samples = len(responses)
+    return {
+        "schema_version": 1,
+        "model_name": model_name,
+        "model_path": str(Path(model_path).resolve()) if model_path else None,
+        "backend": backend,
+        "benchmark": benchmark,
+        "problem_id": row["id"],
+        "problem": row["problem"],
+        "reference_answer": row["answer"],
+        "metadata": row.get("metadata", {}),
+        "rendered_prompt": rendered_prompt,
+        "samples_per_problem": samples,
+        "problem_score": sum(map(int, correctness)) / max(samples, 1),
+        "generation": {
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "max_new_tokens": int(max_new_tokens),
+            "seed": int(seed),
+        },
+        "outputs": [
+            {
+                "sample_index": sample_index,
+                "response": response,
+                "correct": bool(is_correct),
+                "response_characters": len(response),
+            }
+            for sample_index, (response, is_correct) in enumerate(
+                zip(responses, correctness)
+            )
+        ],
+    }
+
+
+QUESTION_ALIASES = ("problem", "question", "prompt", "input", "query")
+ANSWER_ALIASES = (
+    "answer",
+    "correct_answer",
+    "correct answer",
+    "correctanswer",
+    "ground_truth",
+    "groundtruth",
+    "reference_answer",
+    "target",
+    "final_answer",
+    "solution",
+)
+ID_ALIASES = ("id", "index", "sample_id", "unique_id", "uuid")
+
+
+def _benchmark_kind(name: str, spec: dict[str, Any]) -> str:
+    """Return the evaluator schema for one benchmark.
+
+    ``task_type`` is explicit in the shipped config.  The name fallback keeps
+    old resolved configs readable when they are re-evaluated after upgrading.
+    """
+    value = str(spec.get("task_type", spec.get("grader", ""))).strip().lower()
+    if value in {"gpqa", "multiple_choice", "multiple-choice"}:
+        return "gpqa"
+    normalized = _normalized_key(name)
+    if normalized.startswith("gpqa"):
+        return "gpqa"
+    return "math"
+
+
+def _stable_choice_permutation(identifier: str, count: int, seed: int) -> list[int]:
+    digest = hashlib.sha256(f"{seed}:{identifier}".encode("utf-8")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
+    order = list(range(count))
+    rng.shuffle(order)
+    return order
+
+
+def _as_list(value: Any) -> list[Any] | None:
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return list(parsed) if isinstance(parsed, list) else None
+    return None
+
+
+_GPQA_OPTION_BLOCK_RE = re.compile(
+    r"(?ms)^[ \t]*([A-D])[ \t]*[.)][ \t]*(.*?)(?=^[ \t]*[A-D][ \t]*[.)][ \t]*|\Z)"
+)
+
+
+def _embedded_gpqa_choices(prompt: Any) -> list[str] | None:
+    """Extract an A--D option block embedded in a GPQA prompt.
+
+    The downloaded GPQA Diamond export used by this project has only
+    ``id``, ``prompt`` and ``ground_truth`` columns.  Its prompt already
+    contains the four labelled options, so there are no separate choice
+    columns to read.  Return the last complete A/B/C/D block; using the last
+    block also avoids accidentally treating an ``A.``/``B.`` example in the
+    question stem as the answer choices.
+    """
+    matches = list(_GPQA_OPTION_BLOCK_RE.finditer(str(prompt or "")))
+    for end in range(len(matches), 3, -1):
+        block = matches[end - 4 : end]
+        labels = [match.group(1).upper() for match in block]
+        if labels == ["A", "B", "C", "D"]:
+            values = [re.sub(r"\s+", " ", match.group(2)).strip() for match in block]
+            if all(values):
+                return values
+    return None
+
+
+def _gpqa_choices(
+    row: dict[str, Any], answer_key: str, spec: dict[str, Any]
+) -> tuple[list[str], int, bool]:
+    """Resolve GPQA choices across canonical and prompt/ground-truth exports.
+
+    ``choices_embedded`` is true when the source prompt already contains the
+    labelled options.  Such prompts must not be shuffled or have a second
+    option block appended during rendering: the ground-truth letter refers to
+    the original block in the prompt.
+    """
+    values: list[Any] | None = None
+    explicit = spec.get("choice_keys")
+    if explicit is not None:
+        if not isinstance(explicit, (list, tuple)) or not explicit:
+            raise ValueError("GPQA choice_keys must be a non-empty list")
+        explicit_values = [row.get(str(key)) for key in explicit]
+        # Historical configs use ``Question``/``Correct Answer`` and explicit
+        # choice columns.  If a newer export has prompt/ground_truth instead,
+        # fall through to the schema-independent choices below.
+        if all(value is not None and str(value).strip() for value in explicit_values):
+            values = explicit_values
+
+    if values is None:
+        choices_value = row.get("choices")
+        if choices_value is None:
+            choices_column = next(
+                (key for key in row if _normalized_key(key) == "choices"), None
+            )
+            choices_value = row.get(choices_column) if choices_column else None
+        values = _as_list(choices_value)
+        if values is not None:
+            values = list(values)
+            answer_value = row.get(answer_key)
+            # A few exports provide only the incorrect choices in ``choices``
+            # and store the correct text separately.  Preserve the historical
+            # loader behavior for text answers, but do not insert a letter
+            # such as ``D`` as if it were an option text.
+            if (
+                answer_value is not None
+                and not re.fullmatch(
+                    r"(?:option|choice)?\s*[A-D]\s*[.)]?",
+                    str(answer_value).strip(),
+                    re.I,
+                )
+                and all(
+                    _normalized_key(value) != _normalized_key(answer_value)
+                    for value in values
+                )
+            ):
+                values.insert(0, answer_value)
+
+    if values is None:
+        normalized = {_normalized_key(key): key for key in row}
+        incorrect = []
+        for index in range(1, 10):
+            key = normalized.get(f"incorrectanswer{index}")
+            if key is not None:
+                incorrect.append(key)
+        if not incorrect:
+            # Some exports use answer_0/answer_1/... rather than the
+            # canonical GPQA column names.
+            for index in range(10):
+                key = normalized.get(f"answer{index}")
+                if key is not None:
+                    incorrect.append(key)
+        if incorrect:
+            values = [row.get(answer_key), *(row[key] for key in incorrect)]
+
+    choices_embedded = False
+    if values is None:
+        values = _embedded_gpqa_choices(row.get("prompt", row.get("problem", "")))
+        choices_embedded = values is not None
+
+    if values is None or any(
+        value is None or not str(value).strip() for value in values
+    ):
+        raise ValueError(
+            "GPQA rows must contain a non-empty correct answer and choices; "
+            "supported schemas are canonical choice columns, a choices list, "
+            "or a prompt containing A./B./C./D. options"
+        )
+
+    answer = str(row[answer_key]).strip()
+    choices = [str(value).strip() for value in values]
+    letter = re.fullmatch(r"(?:option|choice)?\s*([A-D])\s*[.)]?", answer, re.I)
+    if letter and 0 <= ord(letter.group(1).upper()) - ord("A") < len(choices):
+        correct_index = ord(letter.group(1).upper()) - ord("A")
+    else:
+        normalized_answer = _normalized_key(answer)
+        try:
+            correct_index = choices.index(answer)
+        except ValueError:
+            matches = [
+                index
+                for index, choice in enumerate(choices)
+                if _normalized_key(choice) == normalized_answer
+            ]
+            if not matches:
+                raise ValueError(
+                    "GPQA correct answer is absent from the resolved choices"
+                ) from None
+            correct_index = matches[0]
+    return choices, correct_index, choices_embedded
+
+
+def _plain(value: Any) -> Any:
+    return value.tolist() if hasattr(value, "tolist") else value
+
+
+def _normalized_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+
+def _read_rows(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == ".parquet":
+        import pandas as pd
+
+        return [
+            {key: _plain(value) for key, value in row.items()}
+            for row in pd.read_parquet(path).to_dict("records")
+        ]
+    if path.suffix.lower() == ".jsonl":
+        with path.open(encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, list) and all(isinstance(row, dict) for row in payload):
+            return payload
+        if isinstance(payload, dict):
+            for key in ("data", "test", "records", "examples"):
+                rows = payload.get(key)
+                if isinstance(rows, list) and all(
+                    isinstance(row, dict) for row in rows
+                ):
+                    return rows
+            return [payload]
+        raise ValueError(f"Unsupported JSON evaluation structure in {path}")
+    raise ValueError(f"Unsupported evaluation file: {path}")
+
+
+def _resolve_benchmark_file(name: str, path: str | Path) -> Path:
+    path = Path(path).resolve()
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        raise FileNotFoundError(f"{name} path does not exist: {path}")
+    preferred = [
+        path / "test.jsonl",
+        path / "test.json",
+        path / "test-00000-of-00001.parquet",
+        path / "test.parquet",
+    ]
+    for candidate in preferred:
+        if candidate.is_file():
+            return candidate
+    candidates = (
+        sorted(path.glob("*.jsonl"))
+        + sorted(path.glob("*.json"))
+        + sorted(path.glob("*.parquet"))
+    )
+    if len(candidates) != 1:
+        raise ValueError(
+            f"Expected one unambiguous data file for {name} under {path}; found {candidates}"
+        )
+    return candidates[0]
+
+
+def _resolve_column(
+    columns: list[str], explicit: str | None, aliases: tuple[str, ...], kind: str
+) -> str:
+    if explicit:
+        if explicit not in columns:
+            # Resolved configs are immutable and may predate a dataset export
+            # rename (for example ``Question`` -> ``prompt`` and
+            # ``Correct Answer`` -> ``ground_truth`` in GPQA Diamond).  Keep
+            # honoring an explicit key when present, but safely migrate to a
+            # known semantic alias when the old key is absent.
+            normalized = {_normalized_key(column): column for column in columns}
+            for alias in aliases:
+                replacement = normalized.get(_normalized_key(alias))
+                if replacement is not None:
+                    return replacement
+            raise ValueError(
+                f"Configured {kind} column {explicit!r} is absent; columns={columns}"
+            )
+        return explicit
+    normalized = {_normalized_key(column): column for column in columns}
+    for alias in aliases:
+        if _normalized_key(alias) in normalized:
+            return normalized[_normalized_key(alias)]
+    raise ValueError(
+        f"Cannot infer {kind} column from {columns}; set {kind}_key in the config"
+    )
+
+
+def load_benchmark(
+    name: str, spec: dict[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    file_path = _resolve_benchmark_file(name, spec["path"])
+    rows = _read_rows(file_path)
+    if not rows:
+        raise ValueError(f"{name} is empty: {file_path}")
+    columns = list(rows[0])
+    kind = _benchmark_kind(name, spec)
+    question_key = _resolve_column(
+        columns, spec.get("question_key"), QUESTION_ALIASES, "question"
+    )
+    answer_key = _resolve_column(
+        columns, spec.get("answer_key"), ANSWER_ALIASES, "answer"
+    )
+    try:
+        id_key = _resolve_column(columns, spec.get("id_key"), ID_ALIASES, "id")
+    except ValueError:
+        id_key = None
+    normalized = []
+    for index, row in enumerate(rows):
+        question = row.get(question_key)
+        identifier = str(row.get(id_key, index) if id_key else index)
+        if question is None or not str(question).strip():
+            raise ValueError(f"{name} row {index} has an empty question/prompt")
+        answer = row.get(answer_key)
+        if answer is None or not str(answer).strip():
+            raise ValueError(f"{name} row {index} has an empty question/answer")
+        item: dict[str, Any] = {
+            "id": identifier,
+            "problem": str(question),
+            "answer": str(answer),
+        }
+        if kind == "gpqa":
+            choices, correct_index, choices_embedded = _gpqa_choices(
+                row, answer_key, spec
+            )
+            # Deterministic choice shuffling avoids putting the correct option
+            # in a fixed position while keeping HF/vLLM and every re-evaluation
+            # byte-for-byte comparable.  Prompt-embedded options already have
+            # labels referenced by ``ground_truth``; changing their order
+            # would invalidate the original prompt, so preserve that order.
+            if choices_embedded:
+                order = list(range(len(choices)))
+            else:
+                shuffle_seed = int(spec.get("choice_shuffle_seed", 0))
+                order = _stable_choice_permutation(
+                    identifier, len(choices), shuffle_seed
+                )
+            item["metadata"] = {
+                "task_type": "gpqa",
+                "choices": [choices[position] for position in order],
+                "correct_choice": order.index(correct_index),
+                "choices_embedded": choices_embedded,
+            }
+        normalized.append(item)
+    schema = {
+        "benchmark": name,
+        "task_type": kind,
+        "file": str(file_path),
+        "format": file_path.suffix.lower().lstrip("."),
+        "rows": len(rows),
+        "columns": columns,
+        "question_key": question_key,
+        "answer_key": answer_key,
+        "id_key": id_key,
+        "examples": [
+            {
+                "id": row["id"],
+                "problem": row["problem"][:500],
+                "answer": row["answer"],
+                **(
+                    {"metadata": row["metadata"]}
+                    if row.get("metadata", {}).get("task_type") == "gpqa"
+                    else {}
+                ),
+            }
+            for row in normalized[:3]
+        ],
+    }
+    return normalized, schema
+
+
+def inspect_evaluation_data(config: dict[str, Any]) -> dict[str, Any]:
+    specs = config["evaluation"]["benchmarks"]
+    report = {}
+    for name in configured_benchmark_names(config):
+        _, report[name] = load_benchmark(name, specs[name])
+    return report
+
+
+def _load_eval_model(path: str | Path, config: dict[str, Any], device: torch.device):
+    path = Path(path).resolve()
+    attention = choose_attention_implementation(
+        config["models"].get("attention_implementation", "auto")
+    )
+    adapter_config = path / "adapter_config.json"
+    if adapter_config.is_file():
+        from peft import AutoPeftModelForCausalLM
+
+        model = AutoPeftModelForCausalLM.from_pretrained(
+            path,
+            local_files_only=True,
+            is_trainable=False,
+            attn_implementation=attention,
+            **model_dtype_kwargs(torch.bfloat16),
+        ).to(device)
+        base_path = json.loads(adapter_config.read_text(encoding="utf-8"))[
+            "base_model_name_or_path"
+        ]
+        tokenizer = AutoTokenizer.from_pretrained(base_path, local_files_only=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            local_files_only=True,
+            attn_implementation=attention,
+            low_cpu_mem_usage=True,
+            **model_dtype_kwargs(torch.bfloat16),
+        ).to(device)
+        tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return model.eval(), tokenizer
+
+
+def _grade(response: str, answer: str) -> bool:
+    try:
+        from math_verify import parse, verify
+
+        return bool(verify(parse(str(answer)), parse(str(response))))
+    except Exception:
+
+        def normalized(value: str) -> str:
+            boxed = re.findall(r"\\boxed\{([^{}]+)\}", value)
+            value = boxed[-1] if boxed else value
+            return re.sub(r"[\s,$]", "", value).lower().strip(".")
+
+        return normalized(response) == normalized(answer)
+
+
+def render_evaluation_prompt(
+    tokenizer,
+    row: dict[str, Any],
+    config: dict[str, Any],
+) -> str:
+    """Render a benchmark-aware prompt using the same chat template everywhere."""
+    metadata = row.get("metadata", {})
+    task_type = metadata.get("task_type", "math")
+    if task_type == "gpqa":
+        labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        choices = metadata.get("choices", [])
+        if not choices:
+            raise ValueError(f"GPQA row {row.get('id')} has no choices")
+        if metadata.get("choices_embedded"):
+            # The source prompt already contains its A./B./C./D. block.  Do
+            # not append a second (possibly reordered) block: ground_truth is
+            # defined against the original labels.
+            problem = (
+                f"{row['problem'].strip()}\n\n"
+                "Reply with the option letter (A, B, C, or D) and optionally a brief explanation."
+            )
+        else:
+            choice_text = "\n".join(
+                f"{labels[index]}. {choice}" for index, choice in enumerate(choices)
+            )
+            problem = (
+                f"{row['problem'].strip()}\n\n"
+                "Choose the single best answer from the options below. "
+                "Reply with the option letter (A, B, C, or D) and optionally a brief explanation.\n"
+                f"{choice_text}"
+            )
+        messages = [{"role": "user", "content": problem}]
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **dict(config["data"].get("chat_template_kwargs", {})),
+        )
+    return render_math_prompt(tokenizer, row["problem"], config["data"])
+
+
+def _normalize_answer_text(value: str) -> str:
+    value = re.sub(r"\s+", " ", str(value)).strip().casefold()
+    return re.sub(r"[\s\.,;:$]+", "", value)
+
+
+def _grade_gpqa(response: str, row: dict[str, Any]) -> bool:
+    metadata = row.get("metadata", {})
+    choices = [str(item) for item in metadata.get("choices", [])]
+    correct_index = metadata.get("correct_choice")
+    if not choices or correct_index is None:
+        return False
+    answer = str(row.get("answer", ""))
+    normalized_response = _normalize_answer_text(response)
+    if _normalize_answer_text(answer) == normalized_response:
+        return True
+    # Prefer an explicit final answer marker, then accept the last standalone
+    # option letter. This handles both terse "B" and explained responses.
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    matches = re.findall(
+        r"(?:final\s+answer|answer|option|choice)\s*(?:is|:)?\s*\(?([A-Z])\)?\b",
+        response,
+        flags=re.IGNORECASE,
+    )
+    if not matches:
+        matches = re.findall(r"\b([A-Z])\b", response.upper())
+    return bool(matches) and labels.find(matches[-1].upper()) == int(correct_index)
+
+
+def grade_evaluation_response(
+    response: str, row: dict[str, Any], benchmark: str | None = None
+) -> bool:
+    task_type = row.get("metadata", {}).get("task_type")
+    if task_type is None and benchmark is not None:
+        task_type = _benchmark_kind(benchmark, {})
+    if task_type == "gpqa":
+        return _grade_gpqa(response, row)
+    return _grade(response, str(row.get("answer", "")))
+
+
+@torch.inference_mode()
+def evaluate_loaded_suite(
+    model,
+    tokenizer,
+    model_name: str,
+    config: dict[str, Any],
+    output_dir: str | Path,
+    *,
+    runtime_settings: dict[str, Any] | None = None,
+):
+    """Evaluate an already-loaded model without changing its training/RNG state."""
+    ensure_extended_benchmark_specs(config)
+    device = next(model.parameters()).device
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    evaluation = {**config["evaluation"], **(runtime_settings or {})}
+    batch_size = int(evaluation.get("batch_size", 16))
+    max_new_tokens = int(evaluation.get("max_new_tokens", 2048))
+    temperature = float(evaluation.get("temperature", 0.7))
+    top_p = float(evaluation.get("top_p", 0.95))
+    samples_per_problem = int(evaluation.get("num_responses", 8))
+    metric_name = evaluation_metric_name(
+        samples_per_problem, evaluation.get("metric")
+    )
+    seed = int(evaluation.get("seed", 1234))
+    if temperature <= 0:
+        raise ValueError("Sampled evaluation requires positive temperature")
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError("Evaluation top_p must be in (0, 1]")
+    if samples_per_problem <= 0:
+        raise ValueError("Evaluation num_responses must be positive")
+    do_sample = True
+    limit = evaluation.get("limit")
+    benchmark_names = configured_benchmark_names(
+        config, evaluation.get("benchmark_names")
+    )
+    loaded = {}
+    total_samples = 0
+    for benchmark in benchmark_names:
+        records, schema = load_benchmark(
+            benchmark, config["evaluation"]["benchmarks"][benchmark]
+        )
+        if limit is not None:
+            records = records[: int(limit)]
+        loaded[benchmark] = (records, schema)
+        total_samples += len(records)
+    suite = {
+        "model": model_name,
+        "benchmarks": {},
+        "parameters": {
+            "backend": evaluation.get("backend", "hf"),
+            "batch_size": batch_size,
+            "max_new_tokens": max_new_tokens,
+            "limit": limit,
+            "do_sample": do_sample,
+            "temperature": temperature,
+            "top_p": top_p,
+            "num_responses": samples_per_problem,
+            "metric": metric_name,
+            "seed": seed,
+        },
+    }
+    cpu_rng_state = torch.get_rng_state()
+    cuda_rng_states = (
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    )
+    previous_training = model.training
+    previous_use_cache = model.config.use_cache
+    model.eval()
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    detailed_output_path = output_dir / "model_outputs_detailed.jsonl.gz"
+    detailed_handle = gzip.open(detailed_output_path, "wt", encoding="utf-8")
+    progress = tqdm(
+        total=total_samples,
+        desc=f"Eval {model_name}",
+        unit="sample",
+        dynamic_ncols=True,
+        leave=True,
+        disable=False,
+        mininterval=0.5,
+    )
+    try:
+        logged_eval_prompt = False
+        for benchmark in benchmark_names:
+            records, schema = loaded[benchmark]
+            correct_generations = graded_generations = problems = 0
+            problem_score_sum = 0.0
+            prediction_path = output_dir / (
+                f"{benchmark.lower().replace('-', '_')}_predictions.jsonl.gz"
+            )
+            with gzip.open(prediction_path, "wt", encoding="utf-8") as handle:
+                for begin in range(0, len(records), batch_size):
+                    progress.set_postfix_str(
+                        f"{benchmark} {metric_name}="
+                        f"{problem_score_sum / max(problems, 1):.3f}"
+                    )
+                    batch = records[begin : begin + batch_size]
+                    prompts = [
+                        render_evaluation_prompt(tokenizer, row, config)
+                        for row in batch
+                    ]
+                    if prompts and not logged_eval_prompt:
+                        tqdm.write(f"Fully rendered EVAL prompt:\n{prompts[0]}")
+                        logged_eval_prompt = True
+                    encoded = tokenizer(
+                        prompts,
+                        padding=True,
+                        add_special_tokens=False,
+                        return_tensors="pt",
+                    ).to(device)
+                    generation_kwargs = {
+                        "do_sample": do_sample,
+                        "num_return_sequences": samples_per_problem,
+                        "max_new_tokens": max_new_tokens,
+                        "eos_token_id": tokenizer.eos_token_id,
+                        "pad_token_id": tokenizer.pad_token_id,
+                        "use_cache": True,
+                        "temperature": temperature,
+                        "top_p": top_p,
+                    }
+                    generated = model.generate(
+                        **encoded,
+                        **generation_kwargs,
+                    )
+                    flat_responses = tokenizer.batch_decode(
+                        generated[:, encoded.input_ids.shape[1] :],
+                        skip_special_tokens=True,
+                    )
+                    expected_responses = len(batch) * samples_per_problem
+                    if len(flat_responses) != expected_responses:
+                        raise RuntimeError(
+                            f"HF generated {len(flat_responses)} responses, expected "
+                            f"{expected_responses}"
+                        )
+                    for row_index, row in enumerate(batch):
+                        begin_response = row_index * samples_per_problem
+                        responses = flat_responses[
+                            begin_response : begin_response + samples_per_problem
+                        ]
+                        correctness = [
+                            grade_evaluation_response(response, row, benchmark)
+                            for response in responses
+                        ]
+                        correct_generations += sum(map(int, correctness))
+                        graded_generations += samples_per_problem
+                        problems += 1
+                        raw_problem_score = sum(correctness) / samples_per_problem
+                        selected_problem_score = metric_problem_score(
+                            correctness, metric_name
+                        )
+                        problem_score_sum += selected_problem_score
+                        detailed_handle.write(
+                            json.dumps(
+                                detailed_model_output_record(
+                                    model_name=model_name,
+                                    model_path=getattr(
+                                        getattr(model, "config", None),
+                                        "_name_or_path",
+                                        None,
+                                    ),
+                                    backend=str(evaluation.get("backend", "hf")),
+                                    benchmark=benchmark,
+                                    row=row,
+                                    rendered_prompt=prompts[row_index],
+                                    responses=responses,
+                                    correctness=correctness,
+                                    temperature=temperature,
+                                    top_p=top_p,
+                                    max_new_tokens=max_new_tokens,
+                                    seed=seed,
+                                ),
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                        handle.write(
+                            json.dumps(
+                                {
+                                    **row,
+                                    "responses": responses,
+                                    "correct": correctness,
+                                    "problem_score": raw_problem_score,
+                                    "metric_score": selected_problem_score,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                    progress.set_postfix_str(
+                        f"{benchmark} {metric_name}="
+                        f"{problem_score_sum / max(problems, 1):.3f}"
+                    )
+                    progress.update(len(batch))
+            selected_score = problem_score_sum / max(problems, 1)
+            benchmark_result = {
+                "correct": correct_generations,
+                "total": graded_generations,
+                "problems": problems,
+                "samples_per_problem": samples_per_problem,
+                "avg_at_n": selected_score,
+                "accuracy": selected_score,
+                "predictions": str(prediction_path),
+                "schema": schema,
+            }
+            if metric_name.startswith("pass@"):
+                benchmark_result["pass_at_k"] = selected_score
+                if metric_name == "pass@8":
+                    benchmark_result["pass_at_8"] = selected_score
+            elif samples_per_problem == 8:
+                benchmark_result["avg_at_8"] = selected_score
+            suite["benchmarks"][benchmark] = benchmark_result
+    finally:
+        detailed_handle.close()
+        progress.close()
+        model.config.use_cache = previous_use_cache
+        model.train(previous_training)
+        torch.set_rng_state(cpu_rng_state)
+        if cuda_rng_states:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+    suite["detailed_outputs"] = str(detailed_output_path.resolve())
+    with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(suite, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    return suite
+
+
+@torch.inference_mode()
+def evaluate_suite(
+    model_name: str,
+    model_path: str | Path,
+    config: dict[str, Any],
+    output_dir: str | Path,
+):
+    ensure_extended_benchmark_specs(config)
+    if model_name not in MODEL_ORDER:
+        raise ValueError(f"Model name must be one of {MODEL_ORDER}, got {model_name!r}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Evaluation requires CUDA")
+    evaluation = config["evaluation"]
+    backend = str(evaluation.get("backend", "hf")).lower()
+    if backend == "vllm":
+        from .vllm_evaluation import evaluate_vllm_suite
+
+        return evaluate_vllm_suite(
+            model_name,
+            model_path,
+            config,
+            output_dir,
+            {
+                "backend": "vllm",
+                "temperature": evaluation.get("temperature", 0.7),
+                "top_p": evaluation.get("top_p", 0.95),
+                "num_responses": evaluation.get("num_responses", 8),
+                "metric": evaluation.get("metric"),
+                "max_new_tokens": evaluation.get("max_new_tokens", 2048),
+                "limit": evaluation.get("limit"),
+                "benchmark_names": list(configured_benchmark_names(config)),
+                "vllm": evaluation.get("vllm", {}),
+            },
+        )
+    if backend != "hf":
+        raise ValueError("evaluation.backend must be 'vllm' or 'hf'")
+    device = torch.device("cuda", 0)
+    model, tokenizer = _load_eval_model(model_path, config, device)
+    try:
+        suite = evaluate_loaded_suite(model, tokenizer, model_name, config, output_dir)
+        suite["model_path"] = str(Path(model_path).resolve())
+        with (Path(output_dir).resolve() / "summary.json").open(
+            "w", encoding="utf-8"
+        ) as handle:
+            json.dump(suite, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        return suite
+    finally:
+        del model
+        torch.cuda.empty_cache()
+
+
+def aggregate_evaluations(
+    model_result_dirs: dict[str, str | Path], output_dir: str | Path
+):
+    requested_order = tuple(model_result_dirs)
+    expected_order = tuple(item for item in MODEL_ORDER if item in model_result_dirs)
+    if (
+        not requested_order
+        or requested_order[0] != "Base"
+        or requested_order != expected_order
+    ):
+        raise ValueError(
+            f"Aggregation requires Base followed by an ordered subset of {MODEL_ORDER[1:]}; "
+            f"got {requested_order}"
+        )
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows, details = [], {}
+    benchmark_names: tuple[str, ...] | None = None
+    for model_name in requested_order:
+        source = Path(model_result_dirs[model_name]).resolve() / "summary.json"
+        result = json.loads(source.read_text(encoding="utf-8"))
+        details[model_name] = result
+        current_names = tuple(result.get("benchmarks", {}))
+        # Ignore the retired IFEval entry when aggregating historical summaries;
+        # never reinterpret its score as AMC23.  New summaries contain AMC23
+        # and therefore pass through unchanged.
+        current_names = tuple(name for name in current_names if name != "IFEval")
+        unknown = set(current_names) - set(BENCHMARK_ORDER)
+        canonical = tuple(name for name in BENCHMARK_ORDER if name in current_names)
+        if not current_names or unknown or current_names != canonical:
+            raise ValueError(
+                f"{model_name} has invalid benchmark order {current_names}; "
+                f"supported order is {BENCHMARK_ORDER}"
+            )
+        if benchmark_names is None:
+            benchmark_names = current_names
+        elif current_names != benchmark_names:
+            raise ValueError(
+                "Cannot aggregate evaluations with different benchmark sets: "
+                f"{benchmark_names} vs {current_names} for {model_name}"
+            )
+        row = {"Method": model_name}
+        for benchmark in benchmark_names:
+            row[benchmark] = result["benchmarks"][benchmark]["accuracy"]
+        rows.append(row)
+    assert benchmark_names is not None
+    payload = {
+        "schema_version": 1,
+        "benchmarks": list(benchmark_names),
+        "rows": rows,
+        "details": details,
+    }
+    with (output_dir / "comparison.json").open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    with (output_dir / "comparison.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=("Method", *benchmark_names))
+        writer.writeheader()
+        writer.writerows(rows)
+    return rows

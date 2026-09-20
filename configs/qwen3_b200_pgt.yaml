@@ -1,0 +1,14 @@
+_base_: qwen3_b200_base.yaml
+
+experiment:
+  method: pgt
+  output_dir: outputs/pgt_opd
+
+# PGT is a local projected-gradient selector.  It intentionally does not use
+# Bellman/RAC recurrence or discounting.  The selector reuses TA's joint
+# student/teacher Top-K cross-scoring but trains only on student Top-K IDs.
+# Both distributions are conditionalized on that support so selector geometry
+# and the differentiable candidate loss use the same categorical simplex.
+selector:
+  joint_cross_scoring: true
+  pgt_vocab_chunk_tokens: 2048

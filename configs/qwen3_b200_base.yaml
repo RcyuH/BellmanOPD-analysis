@@ -1,0 +1,310 @@
+# Shared source of truth. Bash exposes independent global prompt-batch and
+# within-step trajectory micro-batch knobs; all three methods inherit them.
+experiment:
+  method: base
+  seed: 42
+  output_dir: outputs/base_unused
+  require_b200: true
+  allow_existing_output: false
+  verbose_metrics: false
+
+# scripts/train_{opd,ta,rac,cmt,grpo,iw}_b200.sh launches one FSDP rank per visible GPU.
+# rollout.batch_size is global; micro_batch_size_per_gpu is explicitly local.
+distributed:
+  strategy: fsdp
+  backend: nccl
+  fsdp:
+    sharding_strategy: FULL_SHARD
+    use_orig_params: true
+    # Auto-detected from the HF model's _no_split_modules declaration. This
+    # resolves Qwen3DecoderLayer, LlamaDecoderLayer, or Qwen3_5DecoderLayer.
+    transformer_layer_cls_names: null
+    teacher_cpu_offload: false
+    # false reduces/scatters every accumulated microbatch and avoids retaining
+    # full unsharded gradients. Enable only for a measured throughput experiment.
+    use_no_sync: false
+  find_unused_parameters: false
+  gradient_as_bucket_view: true
+  static_graph: true
+  bucket_cap_mb: 100
+
+# Change this one value (or STORAGE_ROOT in the launch scripts) if the shared
+# filesystem is mounted without the leading slash or at another location.
+paths:
+  storage_root: /workspace/storage-shared
+
+models:
+  teacher_path: models/Qwen3-8B
+  student_path: nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base
+  # The student tokenizer is the sole tokenizer. Its prompt/trajectory IDs are
+  # sent directly to the teacher; there is no teacher decode/re-tokenize path.
+  teacher_no_think: true
+  dtype: bfloat16
+  attention_implementation: auto
+
+data:
+  # Local copy of nlile/hendrycks-MATH-benchmark. Use only its train split for
+  # optimization; the disjoint test parquet is configured below for evaluation.
+  path: nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet
+  split: null
+  prompt_key: problem
+  prefer_source_prompt: false
+  max_prompt_tokens: 1024
+  # Fully rendered overlong prompts are excluded; they are never truncated.
+  overlong_prompt_policy: filter
+  chat_template_kwargs:
+    # Shared prompt IDs condition the teacher, so this is deliberately fixed
+    # to Qwen3's hard no-think chat-template switch.
+    enable_thinking: false
+
+rollout:
+  # Default training rollout uses a persistent, same-GPU vLLM server. Student
+  # weights are synchronized through CUDA IPC before every rollout batch.
+  backend: vllm
+  # Global prompt batch. n=1 intentionally creates 64 independent trajectories.
+  batch_size: 64
+  num_responses: 1
+  max_new_tokens: 7168
+  temperature: 1.0
+  top_p: 1.0
+  seed: 42
+  vllm:
+    # This is a co-located engine reservation, not an evaluation sample limit.
+    # It sleeps at level 2 while HF student/teacher scoring and backward run.
+    # Each of two local TP=1 servers receives 32 long trajectories.
+    # preemption/recomputation while leaving ample room for the sleeping trainer.
+    gpu_memory_utilization: 0.40
+    max_num_seqs: 32
+    # 1024 prompt + 7168 generated tokens, plus small serving headroom.
+    max_model_len: 9216
+    max_concurrent_requests: 32
+    # Release the trainer CUDA cache only when the sleeping engine otherwise
+    # cannot wake with this safety margin; avoid empty_cache on every step.
+    wake_headroom_gib: 2
+    enable_prefix_caching: true
+    enable_chunked_prefill: true
+    performance_mode: throughput
+    async_scheduling: true
+    startup_timeout: 600
+    control_timeout: 600
+    generation_timeout: 3600
+    # Optional stale-weight diagnostic after CUDA-IPC synchronization.
+    # When disabled, the rollout API also skips serializing token log-probs;
+    # the common HF scoring pass computes every log-prob needed by the loss.
+    logprob_sanity:
+      enabled: false
+      max_tokens_per_rank: 32
+      tolerance: 0.05
+      fail_on_mismatch: false
+
+# Common thunlp/OPD recipe. These semantics are validated at startup and are
+# shared by OPD, TA-OPD, and RAC; method selectors only supply position weights.
+opd:
+  upstream_repository: https://github.com/thunlp/OPD
+  upstream_commit: ac26e38d6f1572eb027597b48a9f4e01f6915ef8
+  adv_estimator: token_reward_direct
+  top_k_strategy: only_stu
+  reward_weight_mode: student_p
+  loss_agg_mode: token-mean
+  teacher_temperature: 1.0
+
+selector:
+  top_k: 16
+  # Forward rows per scoring call; full-vocabulary logits are consumed and
+  # released one micro-batch at a time, never retained for the full rollout.
+  # Inference-only scoring is much lighter than backward; B200 can score eight
+  # length-bucketed trajectories together; this knob is independent of the
+  # differentiable training micro-batch (8/GPU by default).
+  score_micro_batch_size: 8
+  # Exact compute optimizations: group similar response lengths and never run
+  # student/teacher forwards through right padding after EOS.
+  trim_padding: true
+  length_bucketed_scoring: true
+  # TA/RAC need both directions over the two Top-K supports. Keep the two
+  # model logit views only within one bounded micro-batch and gather both
+  # directions there, eliminating their redundant third student forward.
+  joint_cross_scoring: true
+  score_chunk_steps: 128
+  ta_vocab_chunk_tokens: 2048
+  eps: 1.0e-8
+  q_low: 0.05
+  q_high: 0.95
+  rac_gamma: 0.995
+  rac_w_min: 0.10
+  rac_beta: 2.0
+  # parallel = vectorized O(log T) associative scan; reference is a test/debug fallback.
+  rac_scan_backend: parallel
+
+token_budget:
+  rho: 0.10
+
+training:
+  epochs: 1
+  max_steps: null
+  # Set through RESUME_FROM_CHECKPOINT in the bash wrappers. MAX_STEPS remains
+  # the total target step (not the number of extra steps after resume).
+  resume_from_checkpoint: null
+  resume_allow_config_mismatch: false
+  # Local trajectories per differentiable forward/backward on each GPU.
+  micro_batch_size_per_gpu: 8
+  # Global trajectories per optimizer update, independent of world size. Each
+  # rollout batch is split into these PPO mini-batches; every rank processes its
+  # real share of the same global mini-batch, then splits that share into local
+  # micros.
+  ppo_mini_batch_size: 16
+  # Group similar response lengths to reduce padding
+  # in the differentiable forward/backward pass.
+  length_bucketed_micro_batches: true
+  grad_accum_steps: auto
+  learning_rate: 1.0e-6
+  adam_betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ppo_clip_low: 0.2
+  ppo_clip_high: 0.28
+  ppo_dual_clip: 3.0
+  max_grad_norm: 1.0
+  use_lora: false
+  gradient_checkpointing: true
+  fused_optimizer: true
+  empty_cuda_cache_each_step: false
+  save_checkpoints: true
+  save_interval: 50
+  save_optimizer: true
+
+logging:
+  # Optional detailed TA audit log; disabled by default to bound disk usage.
+  selected_tokens_enabled: false
+  selector_chunk_steps: 50
+  token_score_stats_enabled: true
+  token_score_interval: 50
+  token_score_histogram_bins: 64
+  token_score_raw_sample_size: 2048
+  tensorboard:
+    enabled: true
+    log_dir: tensorboard
+    log_interval: 1
+    flush_secs: 30
+
+# CMT-only optional instrumentation. Disabled for the original training recipe.
+# Relative output_dir is resolved under experiment.output_dir.
+analysis:
+  enabled: false
+  output_dir: analysis
+  tensorboard: true
+  log_every_n_steps: 10
+  save_token_statistics: true
+  save_every_n_steps: 100
+  measure_learning_progress: false
+  learning_progress_every_n_steps: 100
+  num_sequences_to_track: 2
+  num_tokens_per_sequence: 8
+  max_probe_response_position: 512
+  downstream_window_tokens: 32
+  save_full_logits: false
+
+# By default, evaluation runs at step 0, every 50 optimizer steps, and the final
+# step. vLLM uses a short-lived subprocess so its engine memory is returned
+# before training resumes. "hf" remains a single-process/DDP debug fallback;
+# distributed FSDP evaluation exports an HF snapshot and evaluates it with vLLM.
+training_evaluation:
+  enabled: true
+  backend: vllm
+  temperature: 0.7
+  top_p: 0.95
+  num_responses: 8
+  metric: null
+  target_evaluations: null
+  interval_steps: 50
+  eval_at_start: true
+  eval_at_end: true
+  benchmark_names: [Competition-MATH, MATH-500, AIME24, AIME25, GPQA-Diamond, AMC23]
+  # Used only by the Hugging Face fallback backend.
+  batch_size: 1
+  max_new_tokens: 7168
+  limit: null
+  output_subdir: training_eval
+  # The base model and protocol are identical for all methods. Generate step 0
+  # once, then copy the exact same predictions into every run for both speed
+  # and a strictly controlled comparison. Existing valid step-0 artifacts are
+  # also reused after a crash before the first optimizer update.
+  reuse_base_evaluation: true
+  base_cache_dir: outputs/.base_eval_cache
+  # Filesystem coordination timeout for multi-GPU evaluation. This is not a
+  # NCCL timeout; ranks poll sentinels while vLLM replicas run independently.
+  sync_timeout_sec: 86400
+  vllm:
+    tensor_parallel_size: 1
+    # Dynamically consume almost all currently-free VRAM. The training process
+    # remains resident, so using a hard-coded 1.0 would incorrectly claim it.
+    gpu_memory_utilization: auto
+    gpu_headroom_gib: 4
+    # Reserve transient CUDA-graph/attention workspace in addition to the
+    # device headroom while training and periodic evaluation share each GPU.
+    gpu_workspace_headroom_gib: 2
+    max_num_seqs: 256
+    max_model_len: 9216
+    enable_prefix_caching: true
+    enable_chunked_prefill: true
+    # vLLM 0.17.1 increases the B200 scheduling budget in throughput mode;
+    # async scheduling reduces CPU-side gaps without changing sampling config.
+    performance_mode: throughput
+    async_scheduling: true
+    seed: 1234
+
+autotune:
+  # Seven candidates make binary search exactly <=3 probes per method. The
+  # upper range is intentional for 180+ GiB B200; the 90% guard rejects it if
+  # full-parameter backward or RAC scoring leaves insufficient headroom.
+  batch_candidates: [1, 2, 4, 8, 12, 16, 24]
+  max_reserved_fraction: 0.90
+
+evaluation:
+  backend: vllm
+  temperature: 0.7
+  top_p: 0.95
+  num_responses: 8
+  batch_size: 1
+  max_new_tokens: 7168
+  limit: null
+  vllm:
+    tensor_parallel_size: 1
+    gpu_memory_utilization: auto
+    gpu_headroom_gib: 4
+    gpu_workspace_headroom_gib: 2
+    max_num_seqs: 256
+    max_model_len: 9216
+    enable_prefix_caching: true
+    enable_chunked_prefill: true
+    performance_mode: throughput
+    async_scheduling: true
+    seed: 1234
+  benchmarks:
+    Competition-MATH:
+      path: nlp/minhpn19/data/competition_math/data/test-00000-of-00001.parquet
+      question_key: problem
+      answer_key: answer
+      id_key: unique_id
+    MATH-500:
+      path: nlp/minhpn19/data/eval/math500
+    AIME24:
+      path: nlp/minhpn19/data/eval/aime24
+    AIME25:
+      path: nlp/minhpn19/data/eval/aime25
+    GPQA-Diamond:
+      task_type: gpqa
+      path: nlp/minhpn19/data/GPQA-Diamond/gpqa_diamond.jsonl
+      # The server copy uses the prompt/ground_truth export: the prompt
+      # contains its own A./B./C./D. option block.  The loader also migrates
+      # older resolved configs that used Question/Correct Answer columns.
+      question_key: prompt
+      answer_key: ground_truth
+      choice_shuffle_seed: 1234
+    AMC23:
+      task_type: math
+      path: nlp/minhpn19/data/amc23/test-00000-of-00001.parquet
+      question_key: question
+      answer_key: answer
+      id_key: id
+
+plotting:
+  smoothing_window: 10

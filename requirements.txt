@@ -1,0 +1,18 @@
+torch>=2.6
+# Qwen3.5 AutoModelForCausalLM support (including extraction of text_config)
+# first appears in the compatible 4.57 line. Keep <5 for vLLM 0.17.x.
+transformers>=4.57,<5
+accelerate>=1.2
+peft>=0.14
+pandas>=2.0
+pyarrow>=14
+PyYAML>=6
+tqdm>=4.66
+matplotlib>=3.8
+numpy>=1.26
+math-verify>=0.8
+safetensors>=0.4
+packaging>=24
+requests>=2.32
+tensorboard>=2.17
+vllm>=0.17.1,<0.18
