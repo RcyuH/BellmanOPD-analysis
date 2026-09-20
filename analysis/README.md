@@ -1,6 +1,39 @@
 # Analysis pipelines
 
-## Experiment 1: exact prompt-token OPD interventions
+## Experiment 1: prompt-token OPD influence
+
+The default 8-GPU runner uses `fast_first_order` mode. It still scores every
+prompt token at every optimizer step, but replaces the intractable N full-test
+counterfactual evaluations with
+
+```text
+predicted_improvement_t = learning_rate * <grad D_test, grad L_OPD,t>.
+```
+
+`grad D_test` is restricted to the student output projection, uses conditional
+teacher-Top-K KL on a fixed deterministic set of 128 Competition-MATH test
+problems, and is refreshed every 50 training steps. Given that direction, all
+N token inner products are calculated together from one prompt forward. The
+uniform all-parameter SGD update remains the real training update. Logged
+scores in this mode are stored as `predicted_distance_improvement` and marked
+`is_exact_intervention=false`; `distance_before`, `distance_after`, and
+`distance_improvement` are null because no exact branch was evaluated. The
+calibration KL value is from the last gradient refresh, not a measurement at
+every step. The ranking CSV identifies whether its score is measured or
+predicted.
+
+The student is loaded from its base checkpoint and then cast to FP32 before
+training; the teacher remains frozen in BF16. This prevents the small SGD
+updates from being rounded away in BF16. The runner uses SDPA attention for
+FP32 compatibility. This increases student VRAM and compute relative to the
+ordinary BF16 trainer, but avoids a misleading "trained" run with nearly
+unchanged weights.
+
+Set `prompt_token_influence.mode=exact` only for a bounded validation run. The
+exact mode below retains the original causal branching semantics but is not a
+practical full-dataset training configuration.
+
+### Exact validation semantics
 
 `run_prompt_token_influence.py` implements a separate causal branching
 experiment for every token `x_t` in every fully rendered Competition-MATH
@@ -38,14 +71,14 @@ bash analysis/run_prompt_token_influence.sh \
 ```
 
 The launcher uses `torchrun` with eight replicated workers by default. Each
-GPU holds one complete frozen teacher, student, parameter snapshot, and current
-gradient. Token position `t` is owned by rank `t mod 8`, so the eight GPUs
-evaluate eight independent counterfactual branches concurrently. Baseline and
-uniform test distances shard Competition-MATH test examples across ranks and
-sum their KL numerator/token counts with NCCL. Rank zero computes the uniform
-gradient and SGD update once, then broadcasts the updated parameters to the
-other seven replicas; a parameter-signature equality guard verifies the
-result. Only rank zero writes logs and checkpoints.
+GPU holds one complete frozen teacher and student. In fast mode, the fixed
+test-gradient refresh is sharded over eight GPUs and reduced with NCCL; rank
+zero scores every training-prompt token in one vectorized pass. In exact mode,
+token position `t` is owned by rank `t mod 8`, so independent counterfactual
+branches run concurrently. Rank zero computes the real uniform gradient and
+SGD update once, then broadcasts the updated parameters to all replicas; a
+parameter-signature equality guard verifies the result. Only rank zero writes
+logs and checkpoints.
 
 One-GPU smoke test (explicitly override the declared world size):
 
@@ -77,11 +110,12 @@ python -m analysis.summarize_prompt_token_influence \
   --output outputs/token_exp_01/ranking
 ```
 
-This exact design is intentionally expensive: one N-token training prompt
+The exact mode is intentionally expensive: one N-token training prompt
 requires N+2 complete passes over the full test split (baseline, N token
-branches, uniform). `max_steps` exists only for smoke tests; leaving it `null`
-is the declared full-train experiment and no train/test sampling or truncation
-is performed.
+branches, uniform). Use `--set prompt_token_influence.mode=exact` only for
+bounded validation. In fast mode, `max_steps=null` trains over the full train
+split but the influence ranking is an output-head first-order approximation
+using the fixed test calibration subset, not a full-test exact intervention.
 
 ## CMT observational analysis
 

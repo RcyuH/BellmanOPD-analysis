@@ -131,11 +131,14 @@ def apply_sgd_update(
 
 
 def gradient_l2_norm(gradients: Sequence[torch.Tensor | None]) -> float:
-    total = torch.zeros((), dtype=torch.float64)
+    # Keep the reduction on the gradient device. Transferring one scalar per
+    # parameter to CPU would force thousands of CUDA synchronizations per step.
+    total: torch.Tensor | None = None
     for gradient in gradients:
         if gradient is not None:
-            total += gradient.detach().double().square().sum().cpu()
-    return math.sqrt(float(total.item()))
+            squared = gradient.detach().float().square().sum(dtype=torch.float64)
+            total = squared if total is None else total + squared
+    return math.sqrt(float(total.item())) if total is not None else 0.0
 
 
 def _forward_logits(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
@@ -357,4 +360,3 @@ def improvement_record(before: float, after: float) -> dict[str, float]:
         "distance_improvement": absolute,
         "relative_distance_improvement": absolute / before if before != 0.0 else 0.0,
     }
-

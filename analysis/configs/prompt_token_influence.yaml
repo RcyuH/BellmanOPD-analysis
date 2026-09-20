@@ -1,10 +1,15 @@
 _base_: ../../configs/qwen3_b200_opd.yaml
 
-# Exact causal token intervention. This is intentionally a separate runner;
-# it does not enable the observational CMT hooks in analysis/pipeline.py.
+# Prompt-token influence is a separate runner; it does not enable the
+# observational CMT hooks in analysis/pipeline.py.
 experiment:
   method: opd
   require_b200: true
+
+models:
+  # Student is cast to FP32 after loading so tiny SGD updates are not rounded
+  # away in BF16. SDPA supports this mixed student-FP32 / teacher-BF16 setup.
+  attention_implementation: sdpa
 
 # Full Competition-MATH train split; no training subset is configured.
 data:
@@ -20,6 +25,9 @@ data:
 prompt_token_influence:
   enabled: true
   output_dir: outputs/prompt_token_influence
+  # fast_first_order scores every token at every step with a vectorized
+  # first-order influence estimate. Set exact only for very small validation runs.
+  mode: fast_first_order
   # The launcher starts eight replicated workers. Override to 1 only for a
   # deliberate one-GPU smoke test launched without the default shell wrapper.
   expected_world_size: 8
@@ -28,13 +36,22 @@ prompt_token_influence:
   max_steps: null
   train_batch_size: 1
   learning_rate: 5.0e-6
+  student_parameters_float32: true
   actual_update: uniform_mean
-  distance: full_vocab_teacher_to_student_kl
+  # Distance is selected by mode: conditional Top-K KL in fast mode and
+  # full-vocabulary KL in exact mode.
   distance_student_temperature: 1.0
   distance_teacher_temperature: 1.0
   distance_vocab_chunk_positions: 32
   max_eval_prompt_tokens: 2048
   checkpoint_interval: 100
+  fast:
+    # Fixed deterministic Competition-MATH test subset used only to estimate
+    # the test-distance gradient. Training still consumes the full train split.
+    calibration_test_problems: 128
+    test_gradient_interval: 50
+    support_top_k: 16
+    position_chunk: 32
 
 # The standalone intervention runner does not generate responses or launch
 # periodic correctness evaluation. These flags avoid suggesting otherwise in

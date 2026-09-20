@@ -1,8 +1,7 @@
-"""Run exact prompt-token OPD interventions on Competition-MATH.
+"""Train prompt OPD and analyze each token with fast influence or exact probes.
 
-Every distributed worker owns a complete student and teacher. Independent
-single-token branches are partitioned across workers; synchronized baseline
-and uniform evaluations shard the test set and all-reduce their statistics.
+Every distributed worker owns a complete student and teacher. Fast mode is
+the default; exact full-test interventions remain available for validation.
 """
 
 from __future__ import annotations
@@ -55,6 +54,12 @@ from .prompt_token_influence import (
     prompt_opd_losses,
     restore_parameters,
     trainable_parameters,
+)
+from .fast_prompt_token_influence import (
+    FAST_DISTANCE_NAME,
+    SparseHeadDirection,
+    local_teacher_topk_head_gradient,
+    prompt_head_first_order_scores,
 )
 
 
@@ -139,12 +144,23 @@ def _settings(config: dict[str, Any]) -> dict[str, Any]:
         )
     if str(settings.get("actual_update", "uniform_mean")) != "uniform_mean":
         raise ValueError("actual_update must be 'uniform_mean'")
-    if str(settings.get("distance", DISTANCE_NAME)) != DISTANCE_NAME:
-        raise ValueError(f"distance must be {DISTANCE_NAME!r}")
     if int(config.get("selector", {}).get("top_k", OPD_LOSS_TOP_K)) != OPD_LOSS_TOP_K:
         raise ValueError(
             f"The repository OPD objective requires selector.top_k={OPD_LOSS_TOP_K}"
         )
+    if settings.get("student_parameters_float32", True) is not True:
+        raise ValueError(
+            "student_parameters_float32 must be true: BF16 can round the "
+            "requested small SGD updates to zero"
+        )
+    mode = str(settings.get("mode", "fast_first_order"))
+    if mode not in {"fast_first_order", "exact"}:
+        raise ValueError("prompt_token_influence.mode must be fast_first_order or exact")
+    distance_name = (
+        FAST_DISTANCE_NAME if mode == "fast_first_order" else DISTANCE_NAME
+    )
+    if str(settings.get("distance", distance_name)) != distance_name:
+        raise ValueError(f"prompt_token_influence.distance must be {distance_name!r}")
     return settings
 
 
@@ -284,6 +300,114 @@ def _broadcast_student_parameters(
         dist.broadcast(parameter.data, src=0)
 
 
+def _refresh_fast_direction(
+    student,
+    teacher,
+    tokenizer,
+    calibration_prompts: list[str],
+    *,
+    settings: dict[str, Any],
+    runtime: DistributedRuntime,
+    step: int,
+) -> SparseHeadDirection:
+    fast = dict(settings.get("fast", {}))
+    local_prompts = calibration_prompts[runtime.rank :: runtime.world_size]
+
+    def progress(completed: int, total: int) -> None:
+        if runtime.is_main and (
+            completed == total or completed % max(1, total // 4) == 0
+        ):
+            print(
+                json.dumps(
+                    {
+                        "event": "test_gradient_refresh_progress",
+                        "step": step,
+                        "rank": runtime.rank,
+                        "completed_local_problems": completed,
+                        "total_local_problems": total,
+                    }
+                ),
+                flush=True,
+            )
+
+    (
+        gradient_weight,
+        gradient_bias,
+        distance_sum,
+        token_count,
+        problem_count,
+        maximum_observed,
+    ) = local_teacher_topk_head_gradient(
+        student,
+        teacher,
+        tokenizer,
+        local_prompts,
+        device=runtime.device,
+        max_prompt_tokens=int(settings.get("max_eval_prompt_tokens", 2048)),
+        support_top_k=int(fast.get("support_top_k", 16)),
+        student_temperature=float(
+            settings.get("distance_student_temperature", 1.0)
+        ),
+        teacher_temperature=float(
+            settings.get("distance_teacher_temperature", 1.0)
+        ),
+        position_chunk=int(fast.get("position_chunk", 32)),
+        progress_callback=progress,
+    )
+    # The scorer runs under inference_mode; NCCL reduction and normalization
+    # mutate these tensors after it returns, so materialize ordinary tensors.
+    with torch.inference_mode(False):
+        gradient_weight = gradient_weight.clone()
+        if gradient_bias is not None:
+            gradient_bias = gradient_bias.clone()
+    statistics = torch.tensor(
+        [distance_sum, token_count, problem_count],
+        dtype=torch.float64,
+        device=runtime.device,
+    )
+    maximum = torch.tensor(
+        maximum_observed, dtype=torch.int64, device=runtime.device
+    )
+    if runtime.world_size > 1:
+        dist.all_reduce(gradient_weight, op=dist.ReduceOp.SUM)
+        if gradient_bias is not None:
+            dist.all_reduce(gradient_bias, op=dist.ReduceOp.SUM)
+        dist.all_reduce(statistics, op=dist.ReduceOp.SUM)
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    global_distance_sum, global_token_count, global_problem_count = statistics.tolist()
+    if global_token_count <= 0:
+        raise ValueError("Fast calibration set contains no prompt tokens")
+    gradient_weight.div_(global_token_count)
+    if gradient_bias is not None:
+        gradient_bias.div_(global_token_count)
+    active_mask = gradient_weight.abs().sum(dim=-1).gt(0)
+    if gradient_bias is not None:
+        active_mask |= gradient_bias.ne(0)
+    active_ids = active_mask.nonzero(as_tuple=False).flatten()
+    active_weight = gradient_weight.index_select(0, active_ids).contiguous()
+    active_bias = (
+        gradient_bias.index_select(0, active_ids).contiguous()
+        if gradient_bias is not None
+        else None
+    )
+    squared_norm = active_weight.double().square().sum()
+    if active_bias is not None:
+        squared_norm += active_bias.double().square().sum()
+    direction = SparseHeadDirection(
+        active_token_ids=active_ids,
+        weight=active_weight,
+        bias=active_bias,
+        gradient_l2_norm=float(squared_norm.sqrt().item()),
+        distance_value=float(global_distance_sum / global_token_count),
+        num_test_tokens=int(global_token_count),
+        num_test_problems=int(global_problem_count),
+        refresh_step=int(step),
+        support_top_k=int(fast.get("support_top_k", 16)),
+    )
+    del gradient_weight, gradient_bias, active_mask, statistics, maximum
+    return direction
+
+
 def _gather_rows(
     local_rows: list[dict[str, Any]], runtime: DistributedRuntime
 ) -> list[dict[str, Any]]:
@@ -303,7 +427,7 @@ def _gather_rows(
     return rows
 
 
-def _step_rows(
+def _exact_step_rows(
     *,
     model,
     teacher,
@@ -488,8 +612,186 @@ def _step_rows(
     return local_rows, signature
 
 
+def _fast_step_rows(
+    *,
+    model,
+    tokenizer,
+    encoded: dict[str, torch.Tensor],
+    reference,
+    direction: SparseHeadDirection,
+    parameters: list[torch.nn.Parameter],
+    config: dict[str, Any],
+    settings: dict[str, Any],
+    runtime: DistributedRuntime,
+    seed: int,
+    step: int,
+    epoch: int,
+    dataset_index: int,
+    sample_id: str,
+) -> tuple[list[dict[str, Any]], list[float]]:
+    """Score every token vectorially, then apply one real uniform SGD update."""
+    training = config["training"]
+    learning_rate = float(settings.get("learning_rate", training["learning_rate"]))
+    student_temperature = float(config.get("rollout", {}).get("temperature", 1.0))
+    teacher_temperature = float(config.get("opd", {}).get("teacher_temperature", 1.0))
+    valid_coordinates = encoded["attention_mask"].bool().nonzero(as_tuple=False).tolist()
+    token_ids = encoded["input_ids"]
+    common = {
+        "schema_version": SCHEMA_VERSION,
+        "optimizer_step_before": int(step),
+        "optimizer_step_after": int(step + 1),
+        "epoch": int(epoch),
+        "dataset_index": int(dataset_index),
+        "sample_id": str(sample_id),
+        "prompt_num_tokens": len(valid_coordinates),
+        "token_semantics": TOKEN_SEMANTICS,
+        "influence_method": "first_order_output_head",
+        "is_exact_intervention": False,
+        "distance_name": FAST_DISTANCE_NAME,
+        "distance_scope": "fixed_competition_math_calibration_subset",
+        "distance_gradient_refresh_step": direction.refresh_step,
+        "distance_num_test_problems": direction.num_test_problems,
+        "distance_num_test_tokens": direction.num_test_tokens,
+        "distance_support_top_k": direction.support_top_k,
+        "distance_gradient_l2_norm": direction.gradient_l2_norm,
+        "learning_rate": learning_rate,
+        "opd_top_k": OPD_LOSS_TOP_K,
+        "opd_student_temperature": student_temperature,
+        "opd_teacher_temperature": teacher_temperature,
+        "distributed_world_size": runtime.world_size,
+    }
+    rows: list[dict[str, Any]] = []
+    branch_seed = seed + 1_000_003 * step
+    model.train()
+    if runtime.is_main:
+        _seed_everything(branch_seed)
+        token_losses, inner_products = prompt_head_first_order_scores(
+            model,
+            encoded["input_ids"],
+            encoded["attention_mask"],
+            reference,
+            direction,
+            student_temperature=student_temperature,
+            clip_low=float(training.get("ppo_clip_low", 0.2)),
+            clip_high=float(training.get("ppo_clip_high", 0.28)),
+            dual_clip=float(training.get("ppo_dual_clip", 3.0)),
+            chunk_steps=int(config.get("selector", {}).get("score_chunk_steps", 128)),
+        )
+        for prompt_position, (batch_index, padded_position) in enumerate(
+            valid_coordinates
+        ):
+            predicted = learning_rate * float(
+                inner_products[batch_index, padded_position].float().item()
+            )
+            identity = decode_token(
+                tokenizer, int(token_ids[batch_index, padded_position])
+            )
+            rows.append(
+                {
+                    **common,
+                    "worker_rank": 0,
+                    "intervention": "single_token_first_order",
+                    "prompt_position": int(prompt_position),
+                    "padded_tensor_position": int(padded_position),
+                    **identity,
+                    "opd_loss": float(
+                        token_losses[batch_index, padded_position].float().item()
+                    ),
+                    "gradient_l2_norm": None,
+                    "test_train_gradient_inner_product": float(
+                        inner_products[batch_index, padded_position].float().item()
+                    ),
+                    "predicted_distance_improvement": predicted,
+                    "calibration_distance_at_refresh": direction.distance_value,
+                    "distance_before": None,
+                    "distance_after": None,
+                    "distance_improvement": None,
+                    "relative_distance_improvement": None,
+                }
+            )
+        uniform_predicted = learning_rate * float(
+            inner_products[encoded["attention_mask"].bool()].float().mean().item()
+        )
+        del token_losses, inner_products
+    else:
+        uniform_predicted = 0.0
+
+    # Rank zero performs the real all-parameter uniform update. This training
+    # path is unchanged by the output-head approximation used only for ranking.
+    uniform_loss_value = 0.0
+    uniform_grad_norm = 0.0
+    if runtime.is_main:
+        _seed_everything(branch_seed)
+        losses = prompt_opd_losses(
+            model,
+            encoded["input_ids"],
+            encoded["attention_mask"],
+            reference,
+            student_temperature=student_temperature,
+            clip_low=float(training.get("ppo_clip_low", 0.2)),
+            clip_high=float(training.get("ppo_clip_high", 0.28)),
+            dual_clip=float(training.get("ppo_dual_clip", 3.0)),
+            chunk_steps=int(
+                config.get("selector", {}).get("score_chunk_steps", 128)
+            ),
+        )
+        uniform_loss = losses[encoded["attention_mask"].bool()].mean()
+        uniform_gradients = list(
+            torch.autograd.grad(
+                uniform_loss,
+                parameters,
+                allow_unused=True,
+                materialize_grads=False,
+            )
+        )
+        uniform_loss_value = float(uniform_loss.detach().float().item())
+        uniform_grad_norm = gradient_l2_norm(uniform_gradients)
+        apply_sgd_update(parameters, uniform_gradients, learning_rate)
+        del losses, uniform_loss, uniform_gradients
+    _broadcast_student_parameters(parameters, runtime)
+    metrics = torch.tensor(
+        [uniform_loss_value, uniform_grad_norm, uniform_predicted],
+        dtype=torch.float64,
+        device=runtime.device,
+    )
+    if runtime.world_size > 1:
+        dist.broadcast(metrics, src=0)
+    uniform_loss_value, uniform_grad_norm, uniform_predicted = metrics.tolist()
+    signature = _replica_signature(parameters, runtime)
+    if runtime.is_main:
+        rows.append(
+            {
+                **common,
+                "worker_rank": None,
+                "intervention": "uniform_mean_all_prompt_tokens_first_order",
+                "prompt_position": None,
+                "padded_tensor_position": None,
+                "token_id": None,
+                "token_piece": None,
+                "decoded_text": None,
+                "visible_text": "UNIFORM(x_1,...,x_N)",
+                "decoded_utf8_hex": None,
+                "is_special_token": None,
+                "opd_loss": uniform_loss_value,
+                "gradient_l2_norm": uniform_grad_norm,
+                "test_train_gradient_inner_product": (
+                    uniform_predicted / learning_rate
+                ),
+                "predicted_distance_improvement": uniform_predicted,
+                "replica_signature_after": signature,
+                "calibration_distance_at_refresh": direction.distance_value,
+                "distance_before": None,
+                "distance_after": None,
+                "distance_improvement": None,
+                "relative_distance_improvement": None,
+            }
+        )
+    return rows, signature
+
+
 def _run(config: dict[str, Any], runtime: DistributedRuntime) -> dict[str, Any]:
     settings = _settings(config)
+    mode = str(settings.get("mode", "fast_first_order"))
     expected_world_size = settings.get("expected_world_size")
     if expected_world_size is not None and runtime.world_size != int(expected_world_size):
         raise ValueError(
@@ -502,6 +804,11 @@ def _run(config: dict[str, Any], runtime: DistributedRuntime) -> dict[str, Any]:
     _prepare_output(output, config, runtime)
 
     student, teacher, tokenizer, model_metadata = load_models(config, runtime.device)
+    student.float()
+    model_metadata["experiment_student_parameter_dtype"] = "float32"
+    model_metadata["experiment_teacher_parameter_dtype"] = str(
+        next(teacher.parameters()).dtype
+    )
     parameters = trainable_parameters(student)
     initial_signature = _replica_signature(parameters, runtime)
     train_records, train_files = read_records(
@@ -520,6 +827,22 @@ def _run(config: dict[str, Any], runtime: DistributedRuntime) -> dict[str, Any]:
     test_prompts = [
         render_evaluation_prompt(tokenizer, record, config) for record in test_records
     ]
+    calibration_prompts: list[str] = []
+    calibration_indices: list[int] = []
+    fast = dict(settings.get("fast", {}))
+    if mode == "fast_first_order":
+        requested_limit = int(fast.get("calibration_test_problems", 128))
+        if requested_limit < runtime.world_size:
+            raise ValueError(
+                "fast.calibration_test_problems must be at least world_size"
+            )
+        calibration_count = min(requested_limit, len(test_prompts))
+        calibration_indices = sorted(
+            random.Random(seed + 8_000_009).sample(
+                range(len(test_prompts)), calibration_count
+            )
+        )
+        calibration_prompts = [test_prompts[index] for index in calibration_indices]
     epochs = int(settings.get("epochs", 1))
     if epochs <= 0:
         raise ValueError("prompt_token_influence.epochs must be positive")
@@ -529,34 +852,69 @@ def _run(config: dict[str, Any], runtime: DistributedRuntime) -> dict[str, Any]:
         total_steps = min(total_steps, int(configured_max))
     manifest = {
         "schema_version": SCHEMA_VERSION,
-        "experiment": "prompt_token_opd_exact_sgd_intervention",
+        "experiment": "prompt_token_opd_influence",
+        "mode": mode,
         "token_semantics": TOKEN_SEMANTICS,
         "distributed": {
-            "strategy": "replicated_models_token_branch_parallelism",
+            "strategy": (
+                "replicated_models_token_branch_parallelism"
+                if mode == "exact"
+                else "replicated_models_sharded_test_gradient"
+            ),
             "world_size": runtime.world_size,
-            "token_assignment": "prompt_position modulo world_size",
-            "baseline_and_uniform_test_evaluation": "test-sharded all-reduce",
-            "single_token_test_evaluation": "complete test split on owning rank",
+            "token_assignment": (
+                "prompt_position modulo world_size"
+                if mode == "exact"
+                else "all-token vectorized first-order scoring on rank zero"
+            ),
+            "test_gradient_evaluation": "calibration-test-sharded all-reduce",
             "student_update": "uniform SGD on rank zero, then exact parameter broadcast",
             "replica_guard": "sampled parameter signature equality after every step",
             "initial_replica_signature": initial_signature,
         },
-        "distance": {
-            "name": DISTANCE_NAME,
-            "direction": "KL(teacher || student)",
-            "vocabulary": "full",
-            "reduction": "mean over every rendered test-prompt token",
-            "benchmark": benchmark,
-            "num_test_problems": len(test_records),
-            "sampling": False,
-            "truncation": False,
-        },
-        "interventions": {
-            "single_token": "theta - learning_rate * grad(L_t)",
-            "uniform": "theta - learning_rate * grad(mean_t L_t)",
-            "branching": "all branches at a step start from identical theta",
-            "actual_training_update": "uniform branch",
-        },
+        "distance": (
+            {
+                "name": DISTANCE_NAME,
+                "direction": "KL(teacher || student)",
+                "vocabulary": "full",
+                "reduction": "mean over every rendered test-prompt token",
+                "benchmark": benchmark,
+                "num_test_problems": len(test_records),
+                "sampling": False,
+                "truncation": False,
+            }
+            if mode == "exact"
+            else {
+                "name": FAST_DISTANCE_NAME,
+                "direction": "conditional KL(teacher || student)",
+                "parameter_scope": "student output projection",
+                "support_top_k": int(fast.get("support_top_k", 16)),
+                "benchmark": benchmark,
+                "calibration_test_problems": len(calibration_prompts),
+                "calibration_indices": calibration_indices,
+                "gradient_refresh_interval": int(
+                    fast.get("test_gradient_interval", 50)
+                ),
+                "token_scoring": "learning_rate * <grad D, grad L_t>",
+                "exact": False,
+            }
+        ),
+        "interventions": (
+            {
+                "single_token": "theta - learning_rate * grad(L_t)",
+                "uniform": "theta - learning_rate * grad(mean_t L_t)",
+                "branching": "all branches at a step start from identical theta",
+                "actual_training_update": "uniform branch",
+            }
+            if mode == "exact"
+            else {
+                "single_token": "first-order prediction only; no virtual model update",
+                "formula": "learning_rate * <grad D_test, grad L_t>",
+                "parameter_scope": "student output projection",
+                "all_tokens_scored": True,
+                "actual_training_update": "all-parameter uniform SGD branch",
+            }
+        ),
         "train": {
             "files": [str(path) for path in train_files],
             "num_records_after_filter": len(train_records),
@@ -581,13 +939,70 @@ def _run(config: dict[str, Any], runtime: DistributedRuntime) -> dict[str, Any]:
 
     started = time.time()
     checkpoint_interval = int(settings.get("checkpoint_interval", 0))
+    fast_direction: SparseHeadDirection | None = None
     for step in range(total_steps):
+        if mode == "fast_first_order" and (
+            fast_direction is None
+            or step % max(1, int(fast.get("test_gradient_interval", 50))) == 0
+        ):
+            refresh_started = time.time()
+            if runtime.is_main:
+                print(
+                    json.dumps(
+                        {
+                            "event": "test_gradient_refresh_started",
+                            "step": step,
+                            "calibration_problems": len(calibration_prompts),
+                            "world_size": runtime.world_size,
+                        }
+                    ),
+                    flush=True,
+                )
+            fast_direction = _refresh_fast_direction(
+                student,
+                teacher,
+                tokenizer,
+                calibration_prompts,
+                settings=settings,
+                runtime=runtime,
+                step=step,
+            )
+            if runtime.is_main:
+                print(
+                    json.dumps(
+                        {
+                            "event": "test_gradient_refreshed",
+                            "step": step,
+                            "calibration_problems": fast_direction.num_test_problems,
+                            "calibration_tokens": fast_direction.num_test_tokens,
+                            "active_vocabulary_rows": int(
+                                fast_direction.active_token_ids.numel()
+                            ),
+                            "distance": fast_direction.distance_value,
+                            "gradient_l2_norm": fast_direction.gradient_l2_norm,
+                            "elapsed_seconds": time.time() - refresh_started,
+                        }
+                    ),
+                    flush=True,
+                )
         dataset_index = epoch_batch_indices(len(train_records), 1, step, seed)[0]
         epoch = step // len(train_records)
         record = train_records[dataset_index]
         encoded, rendered = tokenize_prompts(
             [record], tokenizer, config["data"], runtime.device
         )
+        if runtime.is_main:
+            print(
+                json.dumps(
+                    {
+                        "event": "training_step_started",
+                        "step": step,
+                        "mode": mode,
+                        "prompt_tokens": int(encoded["attention_mask"].sum().item()),
+                    }
+                ),
+                flush=True,
+            )
         rendered_prompt = rendered[0]
         sample_id = stable_sample_id(record, dataset_index)
         reference = build_prompt_opd_reference(
@@ -599,28 +1014,49 @@ def _run(config: dict[str, Any], runtime: DistributedRuntime) -> dict[str, Any]:
             student_temperature=float(config.get("rollout", {}).get("temperature", 1.0)),
             teacher_temperature=float(config.get("opd", {}).get("teacher_temperature", 1.0)),
         )
-        snapshot = clone_parameters(parameters)
         step_started = time.time()
-        local_rows, signature = _step_rows(
-            model=student,
-            teacher=teacher,
-            tokenizer=tokenizer,
-            encoded=encoded,
-            reference=reference,
-            test_prompts=test_prompts,
-            parameters=parameters,
-            snapshot=snapshot,
-            config=config,
-            settings=settings,
-            runtime=runtime,
-            seed=seed,
-            step=step,
-            epoch=epoch,
-            dataset_index=dataset_index,
-            sample_id=sample_id,
-        )
-        rows = _gather_rows(local_rows, runtime)
-        del snapshot, reference, local_rows
+        if mode == "exact":
+            snapshot = clone_parameters(parameters)
+            local_rows, signature = _exact_step_rows(
+                model=student,
+                teacher=teacher,
+                tokenizer=tokenizer,
+                encoded=encoded,
+                reference=reference,
+                test_prompts=test_prompts,
+                parameters=parameters,
+                snapshot=snapshot,
+                config=config,
+                settings=settings,
+                runtime=runtime,
+                seed=seed,
+                step=step,
+                epoch=epoch,
+                dataset_index=dataset_index,
+                sample_id=sample_id,
+            )
+            rows = _gather_rows(local_rows, runtime)
+            del snapshot, local_rows
+        else:
+            if fast_direction is None:
+                raise AssertionError("Fast influence direction was not initialized")
+            rows, signature = _fast_step_rows(
+                model=student,
+                tokenizer=tokenizer,
+                encoded=encoded,
+                reference=reference,
+                direction=fast_direction,
+                parameters=parameters,
+                config=config,
+                settings=settings,
+                runtime=runtime,
+                seed=seed,
+                step=step,
+                epoch=epoch,
+                dataset_index=dataset_index,
+                sample_id=sample_id,
+            )
+        del reference
         if runtime.is_main:
             atomic_jsonl(output / "steps" / f"step-{step:06d}.jsonl", rows)
             token_ids = (
@@ -641,12 +1077,16 @@ def _run(config: dict[str, Any], runtime: DistributedRuntime) -> dict[str, Any]:
                     "token_ids": token_ids,
                     "num_tokens": len(token_ids),
                     "world_size": runtime.world_size,
-                    "token_assignment": {
-                        str(rank): assigned_prompt_positions(
-                            len(token_ids), rank, runtime.world_size
-                        )
-                        for rank in range(runtime.world_size)
-                    },
+                    "token_assignment": (
+                        {
+                            str(rank): assigned_prompt_positions(
+                                len(token_ids), rank, runtime.world_size
+                            )
+                            for rank in range(runtime.world_size)
+                        }
+                        if mode == "exact"
+                        else {"0": "all positions, vectorized first-order"}
+                    ),
                     "replica_signature_after": signature,
                     "elapsed_seconds": time.time() - step_started,
                 },
@@ -659,12 +1099,14 @@ def _run(config: dict[str, Any], runtime: DistributedRuntime) -> dict[str, Any]:
                 student.save_pretrained(checkpoint, safe_serialization=True)
                 tokenizer.save_pretrained(checkpoint)
             token_rows = [
-                row for row in rows if row["intervention"] == "single_token"
+                row
+                for row in rows
+                if row["intervention"].startswith("single_token")
             ]
             uniform_row = next(
                 row
                 for row in rows
-                if row["intervention"] == "uniform_mean_all_prompt_tokens"
+                if row["intervention"].startswith("uniform_mean_all_prompt_tokens")
             )
             print(
                 json.dumps(
@@ -674,10 +1116,20 @@ def _run(config: dict[str, Any], runtime: DistributedRuntime) -> dict[str, Any]:
                         "dataset_index": dataset_index,
                         "tokens": len(token_rows),
                         "world_size": runtime.world_size,
+                        "mode": mode,
                         "best_token_improvement": max(
-                            row["distance_improvement"] for row in token_rows
+                            row[
+                                "distance_improvement"
+                                if mode == "exact"
+                                else "predicted_distance_improvement"
+                            ]
+                            for row in token_rows
                         ),
-                        "uniform_improvement": uniform_row["distance_improvement"],
+                        "uniform_improvement": uniform_row[
+                            "distance_improvement"
+                            if mode == "exact"
+                            else "predicted_distance_improvement"
+                        ],
                         "elapsed_seconds": time.time() - step_started,
                     },
                     ensure_ascii=False,
