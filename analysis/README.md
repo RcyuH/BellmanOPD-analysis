@@ -1,4 +1,69 @@
-# CMT analysis pipeline
+# Analysis pipelines
+
+## Experiment 1: exact prompt-token OPD interventions
+
+`run_prompt_token_influence.py` implements a separate causal branching
+experiment for every token `x_t` in every fully rendered Competition-MATH
+training prompt. At optimizer step `s`, all branches start from exactly the
+same `theta_s`:
+
+```text
+token branch t: theta_(s,t) = theta_s - learning_rate * grad L_OPD,t
+uniform branch: theta_(s,u) = theta_s - learning_rate * grad mean_t L_OPD,t
+```
+
+After each virtual update it measures the token-weighted, full-vocabulary
+`KL(teacher || student)` over **every rendered prompt token of every problem in
+the Competition-MATH test split**. Positive `distance_improvement` means the
+student moved closer to the teacher. Parameters are restored from an exact
+device-side snapshot before the next token branch, so token branches at a step
+never contaminate one another. The uniform branch is retained as the real SGD
+update and training proceeds through the full shuffled Competition-MATH train
+split. This is plain SGD by design and exactly matches the requested update;
+there is no hidden Adam state, gradient clipping, or weight decay.
+
+Position `t` means the teacher/student next-token distributions immediately
+after consuming prompt token `x_t`. Consequently an N-token rendered prompt
+has N interventions, including chat-template/special tokens and the final
+assistant-prefix token. Each row stores raw ID, tokenizer piece, whitespace-
+preserving decoded text, a terminal-visible rendering, UTF-8 bytes, and the
+special-token flag. The full rendered prompt and complete ordered token-ID list
+are stored once in the matching `prompts/step-*.json` file.
+
+Run on one B200 (paths inherit the normal repository config):
+
+```bash
+bash analysis/run_prompt_token_influence.sh \
+  --set prompt_token_influence.output_dir=outputs/token_exp_01
+```
+
+Outputs:
+
+```text
+manifest.json
+resolved_config.yaml
+steps/step-*.jsonl
+prompts/step-*.json
+checkpoints/step-*/
+summary.json
+```
+
+Rank the most improving tokens globally and compare them with the uniform
+branch at each step:
+
+```bash
+python -m analysis.summarize_prompt_token_influence \
+  --input outputs/token_exp_01 \
+  --output outputs/token_exp_01/ranking
+```
+
+This exact design is intentionally expensive: one N-token training prompt
+requires N+2 complete passes over the full test split (baseline, N token
+branches, uniform). `max_steps` exists only for smoke tests; leaving it `null`
+is the declared full-train experiment and no train/test sampling or truncation
+is performed.
+
+## CMT observational analysis
 
 This folder provides two paths:
 
