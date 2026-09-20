@@ -11,10 +11,12 @@ import torch
 from analysis.metrics import conditional_d_comparison, correlations, quantile_curve
 from analysis.pipeline import AnalysisLogger
 from analysis.run_analysis import _legacy_score_samples
+from b200_experiment.selectors.cmt_selector import CMTSelector
+from b200_experiment.selectors.pgt_selector import PGTOutput
 from b200_experiment.scoring import RolloutBatch
 from b200_experiment.distributed import DistributedContext
 from b200_experiment.opd_core import topk_reference_from_logits
-from b200_experiment.trainer import _opd_train_step
+from b200_experiment.trainer import _globalize_cmt_output, _opd_train_step
 
 
 class _SingleRank:
@@ -40,6 +42,64 @@ class _ToyStudent(torch.nn.Module):
 
     def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False, return_dict=True):
         return SimpleNamespace(logits=self.projection(self.embedding(input_ids)))
+
+
+def test_cmt_globalization_preserves_support_needed_by_progress_probe():
+    valid = torch.ones(1, 2, dtype=torch.bool)
+    student = torch.log(torch.tensor([[[.6, .4], [.7, .3]]]))
+    teacher = torch.log(torch.tensor([[[.4, .6], [.3, .7]]]))
+    ids = torch.tensor([[[3, 4], [3, 4]]])
+    gain = torch.full((1, 2), .2)
+    pgt = PGTOutput(
+        gain,
+        {
+            "gain": gain,
+            "student_support_mass": torch.ones_like(gain),
+            "teacher_support_mass": torch.ones_like(gain),
+            "teacher_tail_mass": torch.zeros_like(gain),
+            "support_width": torch.full_like(gain, 2),
+        },
+        ids,
+        student,
+        teacher,
+        torch.ones_like(ids, dtype=torch.bool),
+    )
+    local = CMTSelector().compute_scores(pgt, torch.tensor([[3, 4]]), valid)
+    primary, _, _, _ = _globalize_cmt_output(
+        local, valid, DistributedContext(0, 0, 1, torch.device("cpu"))
+    )
+    assert isinstance(primary, PGTOutput)
+    assert torch.equal(primary.scores, local.scores)
+    assert torch.equal(primary.candidate_ids, local.candidate_ids)
+    assert torch.equal(primary.support_mask, local.support_mask)
+    assert torch.equal(primary.teacher_candidate_log_probs, local.teacher_candidate_log_probs)
+    rollout = RolloutBatch(
+        input_ids=torch.tensor([[1, 2, 3, 4]]),
+        attention_mask=torch.ones(1, 4, dtype=torch.long),
+        response_ids=torch.tensor([[3, 4]]),
+        valid_mask=valid,
+        rollout_log_probs=torch.zeros(1, 2),
+        prompt_width=2,
+    )
+    sampled_scores = SimpleNamespace(sampled_log_probs=torch.zeros(1, 2), entropies=torch.ones(1, 2))
+    with tempfile.TemporaryDirectory() as temporary:
+        logger = AnalysisLogger(Path(temporary), {"tensorboard": False}, _SingleRank())
+        session = logger.begin_rollout(
+            scoring_step=1,
+            first_optimizer_step=1,
+            rollout=rollout,
+            selector=primary,
+            student_scores=sampled_scores,
+            teacher_scores=sampled_scores,
+            objective_valid=valid,
+            sample_ids=["sample::response-0"],
+            dataset_indices=[0],
+            temperature=1.0,
+        )
+        measured = session._probe_scores(_ToyStudent(), [(0, 0)])
+        assert len(measured) == 1
+        assert measured[0]["kl_support_reverse"] >= 0
+        logger.close()
 
 
 def test_analysis_keeps_token_identity_and_measures_same_prefix_before_after():

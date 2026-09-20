@@ -395,7 +395,7 @@ def _globalize_cmt_output(
     local: PGTOutput,
     valid_mask: torch.Tensor,
     distributed: DistributedContext,
-) -> tuple[SelectorOutput, dict[str, torch.Tensor], int, int]:
+) -> tuple[PGTOutput, dict[str, torch.Tensor], int, int]:
     """Gather CMT scores; Gibbs allocation is intentionally PPO-group local."""
     keys = (
         "gain",
@@ -440,7 +440,14 @@ def _globalize_cmt_output(
     # update consumes one global PPO group (e.g. 64 trajectories).  The solver is
     # called inside _opd_train_step on exactly the rows used by that update.
     return (
-        SelectorOutput(local.diagnostics["s_CMT"], dict(local.diagnostics)),
+        PGTOutput(
+            local.diagnostics["s_CMT"],
+            dict(local.diagnostics),
+            local.candidate_ids,
+            local.student_candidate_log_probs,
+            local.teacher_candidate_log_probs,
+            local.support_mask,
+        ),
         gathered,
         start,
         end,
