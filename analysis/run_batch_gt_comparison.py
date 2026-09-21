@@ -71,10 +71,10 @@ def _settings(config: dict[str, Any]) -> dict[str, Any]:
     if not 0.0 < fraction <= 1.0:
         raise ValueError("batch_gt_comparison.token_fraction must be in (0,1]")
     weighting = str(settings.get("selected_token_weighting", "binary"))
-    if weighting not in {"binary", "bounded_rank"}:
+    if weighting not in {"binary", "raw_gt", "bounded_rank"}:
         raise ValueError(
             "batch_gt_comparison.selected_token_weighting must be "
-            "'binary' or 'bounded_rank'"
+            "'binary', 'raw_gt', or 'bounded_rank'"
         )
     minimum = float(settings.get("selected_weight_min", 0.5))
     maximum = float(settings.get("selected_weight_max", 1.5))
@@ -397,11 +397,18 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
                 float(settings.get("selected_weight_min", 0.5)),
                 float(settings.get("selected_weight_max", 1.5)),
             ],
-            "weighting_note": (
-                "bounded_rank uses g_t magnitude only for top-rho selection and "
-                "rank order; selected weights are linear in rank and normalized "
-                "to unit total mass by the loss"
-            ),
+            "weighting_note": {
+                "binary": "every selected token has equal raw weight 1",
+                "raw_gt": (
+                    "every selected token uses its exact positive finite g_t as "
+                    "raw weight"
+                ),
+                "bounded_rank": (
+                    "g_t magnitude is used only for top-rho selection and rank "
+                    "order; selected weights are linear in rank"
+                ),
+            }[str(settings.get("selected_token_weighting", "binary"))],
+            "loss_normalization": "raw token weights are normalized to unit total mass",
         },
         "loss": {
             "top_gt": "normalized weighted OPD loss over selected tokens only",

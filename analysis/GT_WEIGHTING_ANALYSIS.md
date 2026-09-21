@@ -38,3 +38,7 @@ run's failure against uniform OPD. This new bounded-rank mode tests a separate
 hypothesis: whether mild prioritization *within* the selected set helps. It
 does not address the observed tendency of `g_t` selection itself to favor chat
 and reasoning-wrapper tokens.
+
+For the direct ablation, `selected_token_weighting=raw_gt` uses the exact
+positive finite selected scores before loss normalization. This intentionally
+has no clipping or bounding and should be written to a separate output folder.

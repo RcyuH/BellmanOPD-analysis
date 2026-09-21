@@ -109,9 +109,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 \
 
 The weighting can be overridden without changing the 10% token budget. Use
 `batch_gt_comparison.selected_token_weighting=binary` to give every selected
-token equal weight, or change `selected_weight_min` and `selected_weight_max`
-to test a different bounded rank interval. Keep the interval centred at 1 to
-preserve the selected group's mean raw weight.
+token equal weight. Use `selected_token_weighting=raw_gt` to use the exact
+positive finite `g_t` values without bounding, or change `selected_weight_min`
+and `selected_weight_max` to test a different bounded rank interval. Keep the
+bounded interval centred at 1 to preserve the selected group's mean raw
+weight. All modes normalize their raw weights to unit total mass in the loss.
 The empirical quantiles and transform comparison motivating these defaults are
 recorded in `GT_WEIGHTING_ANALYSIS.md`.
 
@@ -120,7 +122,7 @@ After the first batch, the runner reuses each trajectory's previous exact
 measurements, so this removes redundant evaluation without changing the
 paired statistic.
 
-The raw outputs include every token's `g_t`, batch rank, binary raw weight,
+The raw outputs include every token's `g_t`, batch rank, configured raw weight,
 normalized effective loss weight, tokenizer text, and both branches' OPD loss:
 
 ```text

@@ -46,6 +46,30 @@ def test_top_gt_bounded_rank_weights_ignore_raw_magnitude_and_preserve_mass():
     assert selected.max().item() / selected.min().item() == 3.0
 
 
+def test_top_gt_raw_weights_use_exact_selected_scores():
+    scores = torch.tensor([[1000.0, 10.0, 9.0, 8.0, 7.0]])
+    valid = torch.ones_like(scores, dtype=torch.bool)
+    weights = top_gt_weights(
+        scores,
+        valid,
+        fraction=0.40,
+        weighting="raw_gt",
+    )
+    assert weights.tolist() == [[1000.0, 10.0, 0.0, 0.0, 0.0]]
+    effective = normalized_effective_weights(weights, valid)
+    assert torch.allclose(
+        effective,
+        torch.tensor([[1000.0 / 1010.0, 10.0 / 1010.0, 0.0, 0.0, 0.0]]),
+    )
+
+
+def test_top_gt_raw_weights_reject_nonpositive_selected_scores():
+    scores = torch.zeros((1, 2))
+    valid = torch.ones_like(scores, dtype=torch.bool)
+    with pytest.raises(FloatingPointError, match="finite and positive"):
+        top_gt_weights(scores, valid, fraction=0.50, weighting="raw_gt")
+
+
 def test_top_gt_bounded_rank_rejects_invalid_bounds():
     scores = torch.tensor([[1.0]])
     valid = torch.tensor([[True]])

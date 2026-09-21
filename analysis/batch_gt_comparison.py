@@ -138,16 +138,19 @@ def top_gt_weights(
     minimum: float = 0.5,
     maximum: float = 1.5,
 ) -> torch.Tensor:
-    """Select top-g_t tokens and return binary or bounded rank weights.
+    """Select top-g_t tokens and return binary, raw, or bounded weights.
 
+    ``raw_gt`` assigns each selected token its exact positive finite ``g_t``.
     ``bounded_rank`` deliberately ignores the magnitude of ``g_t`` after
     selection.  Selected tokens are assigned stable descending-rank weights
     linearly spanning ``[minimum, maximum]``.  The default interval is centred
     at one, so the selected-token mean stays exactly one while the largest
     relative weight is capped at 3x the smallest.
     """
-    if weighting not in {"binary", "bounded_rank"}:
-        raise ValueError("weighting must be 'binary' or 'bounded_rank'")
+    if weighting not in {"binary", "raw_gt", "bounded_rank"}:
+        raise ValueError(
+            "weighting must be 'binary', 'raw_gt', or 'bounded_rank'"
+        )
     if not math.isfinite(minimum) or not math.isfinite(maximum):
         raise ValueError("minimum and maximum weights must be finite")
     if minimum <= 0 or maximum < minimum:
@@ -168,9 +171,21 @@ def top_gt_weights(
         count = int(selected_indices.numel())
         if count == 0:
             raise ValueError("Top-g_t selection produced no tokens")
-        selected_scores = torch.nan_to_num(
-            ordinary_scores.reshape(-1)[selected_indices], nan=-torch.inf
-        )
+        selected_scores = ordinary_scores.reshape(-1)[selected_indices].float()
+        if weighting == "raw_gt":
+            invalid = (~torch.isfinite(selected_scores)) | (selected_scores <= 0)
+            if bool(invalid.any()):
+                raise FloatingPointError(
+                    "raw_gt requires every selected g_t to be finite and positive; "
+                    f"found {int(invalid.sum().item())} invalid selected scores"
+                )
+            result = torch.zeros(
+                flat_selected.shape, dtype=torch.float32, device=scores.device
+            )
+            result[selected_indices] = selected_scores
+            return result.reshape_as(scores)
+
+        selected_scores = torch.nan_to_num(selected_scores, nan=-torch.inf)
         descending_order = torch.argsort(
             selected_scores, descending=True, stable=True
         )
