@@ -133,7 +133,12 @@ def top_gt_weights(
     scores: torch.Tensor, valid_mask: torch.Tensor, fraction: float = 0.10
 ) -> torch.Tensor:
     """Return the exact stable top-ceil(fraction*N) binary batch mask."""
-    return top_budget_mask(scores, valid_mask.bool(), float(fraction)).float()
+    # PGT scoring runs under inference_mode. Materialize an ordinary tensor
+    # before it participates in a differentiable weighted loss.
+    with torch.inference_mode(False):
+        return top_budget_mask(
+            scores, valid_mask.bool(), float(fraction)
+        ).detach().clone().float()
 
 
 def uniform_weights(valid_mask: torch.Tensor) -> torch.Tensor:
@@ -225,4 +230,3 @@ def model_parameter_l2_distance(left, right) -> float:
         difference = left_parameter.detach().float() - right_parameter.detach().float()
         square_sum += float(difference.square().sum().item())
     return math.sqrt(square_sum)
-

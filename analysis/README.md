@@ -63,6 +63,82 @@ branches, uniform). `max_steps` exists only for smoke tests; leaving it `null`
 is the declared full-train experiment and no train/test sampling or truncation
 is performed.
 
+## Experiment 2: batchwise top-10% `g_t` versus uniform OPD
+
+`run_batch_gt_comparison.py` tests whether the production PGT score is useful
+as a token selector. Two student trajectories start from the same checkpoint
+and consume the exact same shuffled Competition-MATH batches:
+
+- `top_gt`: compute
+  `g_t = Var_{p_U}(log q_U - log p_U)` on the conditional union of Student and
+  Teacher Top-K, select exactly `ceil(0.10 * N_valid)` highest-scoring tokens
+  over the whole batch, then minimize the mean OPD loss over those tokens.
+- `uniform`: minimize the mean OPD loss over every valid token in the same
+  batch.
+
+Both use the same Student-Top-16 OPD loss, AdamW hyperparameters, gradient
+clipping, data order, and teacher. After every update, the runner measures the
+full-vocabulary `KL(teacher || student)` on the full Competition-MATH test
+split. For each trajectory it records `KL(theta_before)-KL(theta_after)` and
+then the paired advantage
+`improvement_top_gt-improvement_uniform`. The two trajectories evolve
+independently after their first batch, so each improvement is relative to that
+trajectory's own pre-batch state. Final and periodic model weights are saved
+separately under `checkpoints/top_gt/` and `checkpoints/uniform/`.
+
+Run:
+
+```bash
+bash analysis/run_batch_gt_comparison.sh \
+  --set batch_gt_comparison.output_dir=outputs/gt_exp_02
+```
+
+Run on eight GPUs. Each rank keeps identical replicas of both training
+trajectories, while the exact Competition-MATH test KL is split into eight
+disjoint shards and reduced across ranks. Rank 0 alone writes outputs and
+checkpoints:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 \
+  bash analysis/run_batch_gt_comparison.sh \
+  --set batch_gt_comparison.output_dir=outputs/gt_exp_02_8gpu
+```
+
+After the first batch, the runner reuses each trajectory's previous exact
+`KL_after` as its next `KL_before`; no model update occurs between these two
+measurements, so this removes redundant evaluation without changing the
+paired statistic.
+
+The raw outputs include every token's `g_t`, batch rank, binary raw weight,
+normalized effective loss weight, tokenizer text, and both branches' OPD loss:
+
+```text
+manifest.json
+steps/step-*.json
+weights/step-*.jsonl
+prompts/step-*.json
+checkpoints/top_gt/{step-*,final}/
+checkpoints/uniform/{step-*,final}/
+summary.json
+```
+
+Summarize batch wins, mean improvement advantage, paired bootstrap interval,
+trajectory-level KL reduction, and final test KL:
+
+```bash
+python -m analysis.summarize_batch_gt_comparison \
+  --input outputs/gt_exp_02 \
+  --output outputs/gt_exp_02/comparison
+```
+
+The runner invokes this summary automatically after a complete run; the
+standalone command is useful for recomputing it from a partial or copied run.
+
+As in Experiment 1, full-test KL is deliberately exact and expensive. For a
+quick end-to-end smoke test, pass
+`--set batch_gt_comparison.max_steps=1`; the declared experiment keeps it
+`null` and consumes the full train split.
+
 ## CMT observational analysis
 
 This folder provides two paths:

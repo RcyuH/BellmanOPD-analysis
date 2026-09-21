@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import time
 from pathlib import Path
@@ -22,6 +23,11 @@ from b200_experiment.data import (
     stable_sample_id,
     tokenize_prompts,
     validate_prompt_records,
+)
+from b200_experiment.distributed import (
+    DistributedContext,
+    contiguous_partition,
+    initialize_distributed,
 )
 from b200_experiment.evaluation import load_benchmark, render_evaluation_prompt
 from b200_experiment.models import load_models, load_student_model
@@ -42,10 +48,11 @@ from .prompt_token_influence import (
     atomic_json,
     atomic_jsonl,
     build_prompt_opd_reference,
-    competition_math_teacher_distance,
     decode_token,
+    full_vocab_forward_kl_from_logits,
     improvement_record,
 )
+from .summarize_batch_gt_comparison import summarize as summarize_comparison
 
 
 def _seed(seed: int) -> None:
@@ -94,6 +101,143 @@ def _distance_kwargs(settings: dict[str, Any], device: torch.device) -> dict[str
     }
 
 
+@torch.inference_mode()
+def _distributed_pair_teacher_distance(
+    top_gt_student,
+    uniform_student,
+    teacher,
+    tokenizer,
+    rendered_test_prompts: list[str],
+    *,
+    distributed: DistributedContext,
+    distance_kwargs: dict[str, Any],
+) -> tuple[dict[str, float | int | str], dict[str, float | int | str]]:
+    """Evaluate both students on one test shard while sharing teacher forwards."""
+    begin, end = contiguous_partition(
+        len(rendered_test_prompts), distributed.rank, distributed.world_size
+    )
+    local_prompts = rendered_test_prompts[begin:end]
+    top_was_training = top_gt_student.training
+    uniform_was_training = uniform_student.training
+    top_gt_student.eval()
+    uniform_student.eval()
+    teacher.eval()
+    local_top_sum = 0.0
+    local_uniform_sum = 0.0
+    local_tokens = 0
+    local_maximum = 0
+    max_prompt_tokens = int(distance_kwargs["max_prompt_tokens"])
+    for local_index, prompt in enumerate(local_prompts):
+        encoded = tokenizer(
+            prompt,
+            add_special_tokens=False,
+            return_tensors="pt",
+            truncation=False,
+        )
+        length = int(encoded["attention_mask"].sum().item())
+        local_maximum = max(local_maximum, length)
+        if length > max_prompt_tokens:
+            global_index = begin + local_index
+            raise ValueError(
+                f"Competition-MATH test prompt {global_index} has {length} tokens, "
+                f"above max_eval_prompt_tokens={max_prompt_tokens}; refusing to "
+                "truncate or silently exclude a test example"
+            )
+        input_ids = encoded["input_ids"].to(distributed.device)
+        attention_mask = encoded["attention_mask"].to(distributed.device)
+        forward_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "use_cache": False,
+            "return_dict": True,
+        }
+        teacher_logits = teacher(**forward_kwargs).logits
+        top_logits = top_gt_student(**forward_kwargs).logits
+        kl_kwargs = {
+            "student_temperature": float(distance_kwargs["student_temperature"]),
+            "teacher_temperature": float(distance_kwargs["teacher_temperature"]),
+            "vocab_chunk_positions": int(distance_kwargs["vocab_chunk_positions"]),
+        }
+        top_sum, top_count = full_vocab_forward_kl_from_logits(
+            top_logits,
+            teacher_logits,
+            attention_mask.bool(),
+            **kl_kwargs,
+        )
+        del top_logits
+        uniform_logits = uniform_student(**forward_kwargs).logits
+        uniform_sum, uniform_count = full_vocab_forward_kl_from_logits(
+            uniform_logits,
+            teacher_logits,
+            attention_mask.bool(),
+            **kl_kwargs,
+        )
+        if int(top_count.item()) != int(uniform_count.item()):
+            raise AssertionError("The two KL branches counted different test tokens")
+        local_top_sum += float(top_sum.item())
+        local_uniform_sum += float(uniform_sum.item())
+        local_tokens += int(top_count.item())
+        del (
+            input_ids,
+            attention_mask,
+            teacher_logits,
+            uniform_logits,
+            top_sum,
+            uniform_sum,
+            top_count,
+            uniform_count,
+        )
+    if top_was_training:
+        top_gt_student.train()
+    if uniform_was_training:
+        uniform_student.train()
+    top_total = distributed.sum_float(local_top_sum)
+    uniform_total = distributed.sum_float(local_uniform_sum)
+    token_count = distributed.sum_int(local_tokens)
+    problem_count = distributed.sum_int(len(local_prompts))
+    maximum = distributed.max_int(local_maximum)
+    if token_count <= 0:
+        raise ValueError("Competition-MATH test split has no rendered tokens")
+    common = {
+        "name": DISTANCE_NAME,
+        "num_tokens": token_count,
+        "num_problems": problem_count,
+        "maximum_prompt_tokens": maximum,
+    }
+    return (
+        {**common, "value": top_total / token_count, "sum": top_total},
+        {**common, "value": uniform_total / token_count, "sum": uniform_total},
+    )
+
+
+def _assert_replicated_training_results(
+    distributed: DistributedContext,
+    top_gt: dict[str, Any],
+    uniform: dict[str, Any],
+) -> None:
+    """Fail before evaluation if supposedly identical rank replicas diverged."""
+    if not distributed.enabled:
+        return
+    for branch, result in (("top_gt", top_gt), ("uniform", uniform)):
+        for key in ("loss", "gradient_l2_norm_before_clip"):
+            value = float(result[key])
+            maximum = distributed.max_float(value)
+            mean = distributed.mean_float(value)
+            if not math.isclose(maximum, mean, rel_tol=1e-6, abs_tol=1e-8):
+                raise RuntimeError(
+                    f"Replicated {branch} training diverged across ranks for {key}: "
+                    f"local={value}, global_mean={mean}, global_max={maximum}"
+                )
+        for key in ("selected_tokens", "valid_tokens"):
+            value = int(result[key])
+            maximum = distributed.max_int(value)
+            total = distributed.sum_int(value)
+            if maximum != value or total != value * distributed.world_size:
+                raise RuntimeError(
+                    f"Replicated {branch} training saw inconsistent {key} across ranks"
+                )
+
+
 def _save_pair(g_model, uniform_model, tokenizer, root: Path, step: int, final: bool) -> None:
     name = "final" if final else f"step-{step:06d}"
     for method, model in (("top_gt", g_model), ("uniform", uniform_model)):
@@ -101,6 +245,22 @@ def _save_pair(g_model, uniform_model, tokenizer, root: Path, step: int, final: 
         destination.mkdir(parents=True, exist_ok=False)
         model.save_pretrained(destination, safe_serialization=True)
         tokenizer.save_pretrained(destination)
+
+
+@torch.no_grad()
+def _assert_identical_initial_students(left, right) -> None:
+    left_named = list(left.named_parameters())
+    right_named = list(right.named_parameters())
+    if len(left_named) != len(right_named):
+        raise AssertionError("The two student trajectories have different structures")
+    for (left_name, left_parameter), (right_name, right_parameter) in zip(
+        left_named, right_named
+    ):
+        if left_name != right_name or not torch.equal(left_parameter, right_parameter):
+            raise AssertionError(
+                "The top-g_t and uniform trajectories did not start from identical "
+                f"weights; first mismatch: {left_name!r} vs {right_name!r}"
+            )
 
 
 def _token_rows(
@@ -163,20 +323,27 @@ def _token_rows(
 
 def run(config: dict[str, Any]) -> dict[str, Any]:
     settings = _settings(config)
-    if not torch.cuda.is_available():
-        raise RuntimeError("Experiment 2 requires a CUDA GPU")
-    device = torch.device("cuda", 0)
+    distributed = initialize_distributed(
+        str(config.get("distributed", {}).get("backend", "nccl"))
+    )
+    device = distributed.device
     seed = int(config.get("experiment", {}).get("seed", 42))
+    # Every rank deliberately runs the same two training updates. The expensive
+    # held-out KL calculation, which dominates this experiment, is sharded.
     _seed(seed)
     output = Path(settings.get("output_dir", "outputs/batch_gt_comparison")).expanduser().resolve()
-    if output.exists() and any(output.iterdir()):
+    output_is_nonempty = output.exists() and any(output.iterdir())
+    if distributed.any(output_is_nonempty):
         raise FileExistsError(f"Output directory is not empty: {output}")
-    output.mkdir(parents=True, exist_ok=True)
-    save_config(config, output / "resolved_config.yaml")
+    if distributed.is_main:
+        output.mkdir(parents=True, exist_ok=True)
+        save_config(config, output / "resolved_config.yaml")
+    distributed.barrier()
 
     g_model, teacher, tokenizer, model_metadata = load_models(config, device)
     uniform_model, _uniform_tokenizer, _uniform_metadata = load_student_model(config, device)
     del _uniform_tokenizer, _uniform_metadata
+    _assert_identical_initial_students(g_model, uniform_model)
     g_optimizer = _adamw(g_model, config)
     uniform_optimizer = _adamw(uniform_model, config)
 
@@ -192,6 +359,8 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     if batch_size <= 0:
         raise ValueError("train_batch_size must be positive")
     epochs = int(settings.get("epochs", 1))
+    if epochs <= 0:
+        raise ValueError("batch_gt_comparison.epochs must be positive")
     steps_per_epoch = math.ceil(len(records) / batch_size)
     total_steps = steps_per_epoch * epochs
     if settings.get("max_steps") is not None:
@@ -232,27 +401,62 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
             "epochs": epochs,
             "planned_steps": total_steps,
             "same_batch_order": True,
+            "matched_training_rng_per_batch": True,
+        },
+        "distributed": {
+            "world_size": distributed.world_size,
+            "training": "identical replicated trajectories on every rank",
+            "test_kl": (
+                "contiguous Competition-MATH shards reduced across ranks; both "
+                "students share each teacher forward"
+            ),
+            "writer_rank": 0,
+            "replica_consistency_check": "loss, gradient norm, and token counts every batch",
+            "before_distance_reuse": (
+                "step t KL_before equals cached step t-1 KL_after because no update "
+                "occurs between batches"
+            ),
         },
         "models": model_metadata,
         "test_schema": test_schema,
     }
-    atomic_json(output / "manifest.json", manifest)
+    if distributed.is_main:
+        atomic_json(output / "manifest.json", manifest)
+    distributed.barrier()
     training = config["training"]
     distance_kwargs = _distance_kwargs(settings, device)
     started = time.time()
     checkpoint_interval = int(settings.get("checkpoint_interval", 0))
+    g_before_cache: dict[str, float | int | str] | None = None
+    uniform_before_cache: dict[str, float | int | str] | None = None
     for step in range(total_steps):
         batch_indices = epoch_batch_indices(len(records), batch_size, step, seed)
         batch_records = [records[index] for index in batch_indices]
         sample_ids = [stable_sample_id(row, index) for row, index in zip(batch_records, batch_indices)]
         encoded, rendered_prompts = tokenize_prompts(batch_records, tokenizer, config["data"], device)
         step_started = time.time()
-        g_before = competition_math_teacher_distance(
-            g_model, teacher, tokenizer, test_prompts, **distance_kwargs
-        )
-        uniform_before = competition_math_teacher_distance(
-            uniform_model, teacher, tokenizer, test_prompts, **distance_kwargs
-        )
+        if g_before_cache is None or uniform_before_cache is None:
+            g_before, uniform_before = _distributed_pair_teacher_distance(
+                g_model,
+                uniform_model,
+                teacher,
+                tokenizer,
+                test_prompts,
+                distributed=distributed,
+                distance_kwargs=distance_kwargs,
+            )
+            if not math.isclose(
+                float(g_before["value"]),
+                float(uniform_before["value"]),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise AssertionError(
+                    "Identical initial students produced different test KL values"
+                )
+        else:
+            g_before = g_before_cache
+            uniform_before = uniform_before_cache
 
         g_reference, g_scores, g_diagnostics = build_prompt_pgt_reference(
             g_model,
@@ -285,6 +489,11 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
             "chunk_steps": int(config.get("selector", {}).get("score_chunk_steps", 128)),
             "max_grad_norm": float(training.get("max_grad_norm", 1.0)),
         }
+        # Match any dropout/stochastic-layer randomness across the two updates.
+        # (Qwen defaults to zero dropout, but keeping this invariant makes the
+        # comparison valid for other compatible student checkpoints too.)
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state(device)
         g_train = train_prompt_batch(
             g_model,
             g_optimizer,
@@ -294,6 +503,8 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
             g_token_weights,
             **common_train_kwargs,
         )
+        torch.set_rng_state(cpu_rng_state)
+        torch.cuda.set_rng_state(cuda_rng_state, device)
         uniform_train = train_prompt_batch(
             uniform_model,
             uniform_optimizer,
@@ -303,12 +514,28 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
             uniform_token_weights,
             **common_train_kwargs,
         )
-        g_after = competition_math_teacher_distance(
-            g_model, teacher, tokenizer, test_prompts, **distance_kwargs
+        expected_selected = math.ceil(
+            float(settings.get("token_fraction", 0.10)) * g_train["valid_tokens"]
         )
-        uniform_after = competition_math_teacher_distance(
-            uniform_model, teacher, tokenizer, test_prompts, **distance_kwargs
+        if g_train["selected_tokens"] != expected_selected:
+            raise AssertionError(
+                f"Expected exactly {expected_selected} top-g_t tokens, got "
+                f"{g_train['selected_tokens']}"
+            )
+        if uniform_train["selected_tokens"] != uniform_train["valid_tokens"]:
+            raise AssertionError("Uniform OPD did not train on every valid batch token")
+        _assert_replicated_training_results(distributed, g_train, uniform_train)
+        g_after, uniform_after = _distributed_pair_teacher_distance(
+            g_model,
+            uniform_model,
+            teacher,
+            tokenizer,
+            test_prompts,
+            distributed=distributed,
+            distance_kwargs=distance_kwargs,
         )
+        g_before_cache = g_after
+        uniform_before_cache = uniform_after
         g_change = improvement_record(float(g_before["value"]), float(g_after["value"]))
         uniform_change = improvement_record(
             float(uniform_before["value"]), float(uniform_after["value"])
@@ -335,40 +562,49 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
             "top_gt_wins_this_batch": (
                 g_change["distance_improvement"] > uniform_change["distance_improvement"]
             ),
-            "student_weight_l2_distance_after_batch": model_parameter_l2_distance(
-                g_model, uniform_model
+            "student_weight_l2_distance_after_batch": (
+                model_parameter_l2_distance(g_model, uniform_model)
+                if distributed.is_main
+                else None
             ),
             "distance_num_test_problems": int(g_before["num_problems"]),
             "distance_num_test_tokens": int(g_before["num_tokens"]),
             "elapsed_seconds": time.time() - step_started,
         }
-        token_rows = _token_rows(
-            tokenizer,
-            encoded,
-            batch_indices,
-            sample_ids,
-            g_scores,
-            g_token_weights,
-            uniform_token_weights,
-            g_train.pop("per_token_loss"),
-            uniform_train.pop("per_token_loss"),
-            step,
-        )
-        atomic_json(output / "steps" / f"step-{step:06d}.json", summary)
-        atomic_jsonl(output / "weights" / f"step-{step:06d}.jsonl", token_rows)
-        atomic_json(
-            output / "prompts" / f"step-{step:06d}.json",
-            {
-                "schema_version": SCHEMA_VERSION,
-                "optimizer_step_before": step,
-                "dataset_indices": batch_indices,
-                "sample_ids": sample_ids,
-                "rendered_prompts": rendered_prompts,
-            },
-        )
+        g_per_token_loss = g_train.pop("per_token_loss")
+        uniform_per_token_loss = uniform_train.pop("per_token_loss")
+        token_rows = None
+        if distributed.is_main:
+            token_rows = _token_rows(
+                tokenizer,
+                encoded,
+                batch_indices,
+                sample_ids,
+                g_scores,
+                g_token_weights,
+                uniform_token_weights,
+                g_per_token_loss,
+                uniform_per_token_loss,
+                step,
+            )
+            atomic_json(output / "steps" / f"step-{step:06d}.json", summary)
+            atomic_jsonl(output / "weights" / f"step-{step:06d}.jsonl", token_rows)
+            atomic_json(
+                output / "prompts" / f"step-{step:06d}.json",
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "optimizer_step_before": step,
+                    "dataset_indices": batch_indices,
+                    "sample_ids": sample_ids,
+                    "rendered_prompts": rendered_prompts,
+                },
+            )
         if checkpoint_interval > 0 and (step + 1) % checkpoint_interval == 0:
-            _save_pair(g_model, uniform_model, tokenizer, output, step + 1, False)
-        print(json.dumps(summary, ensure_ascii=False), flush=True)
+            if distributed.is_main:
+                _save_pair(g_model, uniform_model, tokenizer, output, step + 1, False)
+            distributed.barrier()
+        if distributed.is_main:
+            print(json.dumps(summary, ensure_ascii=False), flush=True)
         del (
             encoded,
             g_reference,
@@ -378,17 +614,37 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
             g_token_weights,
             uniform_token_weights,
             token_rows,
+            g_per_token_loss,
+            uniform_per_token_loss,
         )
-    _save_pair(g_model, uniform_model, tokenizer, output, total_steps, True)
-    result = {
-        "schema_version": SCHEMA_VERSION,
-        "completed_steps": total_steps,
-        "completed_full_train_split": total_steps == steps_per_epoch * epochs,
-        "top_gt_final_checkpoint": str((output / "checkpoints" / "top_gt" / "final").resolve()),
-        "uniform_final_checkpoint": str((output / "checkpoints" / "uniform" / "final").resolve()),
-        "elapsed_seconds": time.time() - started,
-    }
-    atomic_json(output / "summary.json", result)
+    if distributed.is_main:
+        _save_pair(g_model, uniform_model, tokenizer, output, total_steps, True)
+    distributed.barrier()
+    result = None
+    if distributed.is_main:
+        comparison = summarize_comparison(output, output / "comparison")
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "completed_steps": total_steps,
+            "completed_full_train_split": total_steps == steps_per_epoch * epochs,
+            "distributed_world_size": distributed.world_size,
+            "top_gt_final_checkpoint": str(
+                (output / "checkpoints" / "top_gt" / "final").resolve()
+            ),
+            "uniform_final_checkpoint": str(
+                (output / "checkpoints" / "uniform" / "final").resolve()
+            ),
+            "comparison_summary": str(
+                (output / "comparison" / "comparison_summary.json").resolve()
+            ),
+            "comparison_conclusion": comparison["conclusion"],
+            "elapsed_seconds": time.time() - started,
+        }
+        atomic_json(output / "summary.json", result)
+    result = distributed.broadcast_object(result, source=0)
+    if result is None:
+        raise AssertionError("Rank 0 did not produce an experiment summary")
+    distributed.close()
     return result
 
 
@@ -402,9 +658,10 @@ def main() -> None:
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     args = parser.parse_args()
     config = resolve_runtime_paths(apply_overrides(load_config(args.config), args.set))
-    print(yaml.safe_dump(run(config), sort_keys=False, allow_unicode=True))
+    result = run(config)
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(yaml.safe_dump(result, sort_keys=False, allow_unicode=True))
 
 
 if __name__ == "__main__":
     main()
-

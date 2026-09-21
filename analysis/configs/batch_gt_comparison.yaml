@@ -1,0 +1,35 @@
+_base_: ../../configs/qwen3_b200_opd.yaml
+
+experiment:
+  method: opd
+  require_b200: true
+
+data:
+  path: nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet
+  split: null
+  prompt_key: problem
+  prefer_source_prompt: false
+  # The full train split is mandatory: fail instead of filtering/truncating.
+  max_prompt_tokens: 4096
+  overlong_prompt_policy: error
+
+batch_gt_comparison:
+  enabled: true
+  output_dir: outputs/batch_gt_comparison
+  benchmark: Competition-MATH
+  epochs: 1
+  max_steps: null
+  train_batch_size: 4
+  token_fraction: 0.10
+  distance: full_vocab_teacher_to_student_kl
+  distance_student_temperature: 1.0
+  distance_teacher_temperature: 1.0
+  distance_vocab_chunk_positions: 32
+  max_eval_prompt_tokens: 2048
+  checkpoint_interval: 100
+
+training_evaluation:
+  enabled: false
+
+analysis:
+  enabled: false
