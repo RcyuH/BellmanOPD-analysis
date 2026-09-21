@@ -72,7 +72,10 @@ and consume the exact same shuffled Competition-MATH batches:
 - `top_gt`: compute
   `g_t = Var_{p_U}(log q_U - log p_U)` on the conditional union of Student and
   Teacher Top-K, select exactly `ceil(0.10 * N_valid)` highest-scoring tokens
-  over the whole batch, then minimize the mean OPD loss over those tokens.
+  over the whole batch, map their stable within-batch ranks linearly to bounded
+  weights in `[0.5, 1.5]`, then minimize the normalized weighted OPD loss over
+  those tokens. Raw `g_t` magnitudes never enter the loss, so an extreme score
+  cannot receive more than 3x the weight of another selected token.
 - `uniform`: minimize the mean OPD loss over every valid token in the same
   batch.
 
@@ -103,6 +106,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 \
   bash analysis/run_batch_gt_comparison.sh \
   --set batch_gt_comparison.output_dir=outputs/gt_exp_02_8gpu
 ```
+
+The weighting can be overridden without changing the 10% token budget. Use
+`batch_gt_comparison.selected_token_weighting=binary` to give every selected
+token equal weight, or change `selected_weight_min` and `selected_weight_max`
+to test a different bounded rank interval. Keep the interval centred at 1 to
+preserve the selected group's mean raw weight.
+The empirical quantiles and transform comparison motivating these defaults are
+recorded in `GT_WEIGHTING_ANALYSIS.md`.
 
 After the first batch, the runner reuses each trajectory's previous exact
 `KL_after` as its next `KL_before`; no model update occurs between these two

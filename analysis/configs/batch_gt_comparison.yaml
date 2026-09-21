@@ -21,6 +21,11 @@ batch_gt_comparison:
   max_steps: null
   train_batch_size: 4
   token_fraction: 0.10
+  # Select top-10% by g_t, then ignore raw magnitudes and map their stable
+  # within-batch ranks to [0.5, 1.5]. This caps the relative weight ratio at 3x.
+  selected_token_weighting: bounded_rank
+  selected_weight_min: 0.5
+  selected_weight_max: 1.5
   distance: full_vocab_teacher_to_student_kl
   distance_student_temperature: 1.0
   distance_teacher_temperature: 1.0

@@ -70,6 +70,21 @@ def _settings(config: dict[str, Any]) -> dict[str, Any]:
     fraction = float(settings.get("token_fraction", 0.10))
     if not 0.0 < fraction <= 1.0:
         raise ValueError("batch_gt_comparison.token_fraction must be in (0,1]")
+    weighting = str(settings.get("selected_token_weighting", "binary"))
+    if weighting not in {"binary", "bounded_rank"}:
+        raise ValueError(
+            "batch_gt_comparison.selected_token_weighting must be "
+            "'binary' or 'bounded_rank'"
+        )
+    minimum = float(settings.get("selected_weight_min", 0.5))
+    maximum = float(settings.get("selected_weight_max", 1.5))
+    if not math.isfinite(minimum) or not math.isfinite(maximum):
+        raise ValueError("selected token weight bounds must be finite")
+    if minimum <= 0 or maximum < minimum:
+        raise ValueError(
+            "selected token weights require 0 < selected_weight_min <= "
+            "selected_weight_max"
+        )
     if str(settings.get("benchmark", "Competition-MATH")) != "Competition-MATH":
         raise ValueError("Experiment 2 is fixed to Competition-MATH")
     if str(settings.get("distance", DISTANCE_NAME)) != DISTANCE_NAME:
@@ -375,9 +390,21 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
             "support": GT_SUPPORT,
             "selection": "stable descending batch-global top ceil(rho*N_valid)",
             "rho": float(settings.get("token_fraction", 0.10)),
+            "selected_token_weighting": str(
+                settings.get("selected_token_weighting", "binary")
+            ),
+            "selected_weight_bounds": [
+                float(settings.get("selected_weight_min", 0.5)),
+                float(settings.get("selected_weight_max", 1.5)),
+            ],
+            "weighting_note": (
+                "bounded_rank uses g_t magnitude only for top-rho selection and "
+                "rank order; selected weights are linear in rank and normalized "
+                "to unit total mass by the loss"
+            ),
         },
         "loss": {
-            "top_gt": "mean OPD loss over selected tokens only",
+            "top_gt": "normalized weighted OPD loss over selected tokens only",
             "uniform": "mean OPD loss over all valid tokens",
             "opd_support": "student Top-16",
         },
@@ -480,6 +507,11 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
                 g_scores,
                 encoded["attention_mask"],
                 float(settings.get("token_fraction", 0.10)),
+                weighting=str(
+                    settings.get("selected_token_weighting", "binary")
+                ),
+                minimum=float(settings.get("selected_weight_min", 0.5)),
+                maximum=float(settings.get("selected_weight_max", 1.5)),
             )
             uniform_token_weights = uniform_weights(encoded["attention_mask"])
             uniform_reference = build_prompt_opd_reference(
@@ -576,6 +608,18 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
                 "top_gt_selected_tokens": g_train["selected_tokens"],
                 "top_gt_selected_fraction": (
                     g_train["selected_tokens"] / g_train["valid_tokens"]
+                ),
+                "top_gt_selected_token_weighting": str(
+                    settings.get("selected_token_weighting", "binary")
+                ),
+                "top_gt_selected_raw_weight_min": float(
+                    g_token_weights[g_token_weights > 0].min().item()
+                ),
+                "top_gt_selected_raw_weight_mean": float(
+                    g_token_weights[g_token_weights > 0].mean().item()
+                ),
+                "top_gt_selected_raw_weight_max": float(
+                    g_token_weights[g_token_weights > 0].max().item()
                 ),
                 "top_gt_loss": g_train["loss"],
                 "uniform_loss": uniform_train["loss"],

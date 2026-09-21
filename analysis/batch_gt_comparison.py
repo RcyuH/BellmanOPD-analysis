@@ -130,15 +130,69 @@ def build_prompt_pgt_reference(
 
 
 def top_gt_weights(
-    scores: torch.Tensor, valid_mask: torch.Tensor, fraction: float = 0.10
+    scores: torch.Tensor,
+    valid_mask: torch.Tensor,
+    fraction: float = 0.10,
+    *,
+    weighting: str = "binary",
+    minimum: float = 0.5,
+    maximum: float = 1.5,
 ) -> torch.Tensor:
-    """Return the exact stable top-ceil(fraction*N) binary batch mask."""
-    # PGT scoring runs under inference_mode. Materialize an ordinary tensor
-    # before it participates in a differentiable weighted loss.
+    """Select top-g_t tokens and return binary or bounded rank weights.
+
+    ``bounded_rank`` deliberately ignores the magnitude of ``g_t`` after
+    selection.  Selected tokens are assigned stable descending-rank weights
+    linearly spanning ``[minimum, maximum]``.  The default interval is centred
+    at one, so the selected-token mean stays exactly one while the largest
+    relative weight is capped at 3x the smallest.
+    """
+    if weighting not in {"binary", "bounded_rank"}:
+        raise ValueError("weighting must be 'binary' or 'bounded_rank'")
+    if not math.isfinite(minimum) or not math.isfinite(maximum):
+        raise ValueError("minimum and maximum weights must be finite")
+    if minimum <= 0 or maximum < minimum:
+        raise ValueError("weights require 0 < minimum <= maximum")
+
+    # PGT scoring runs under inference_mode. Materialize ordinary tensors
+    # before they participate in a differentiable weighted loss.
     with torch.inference_mode(False):
-        return top_budget_mask(
-            scores, valid_mask.bool(), float(fraction)
-        ).detach().clone().float()
+        ordinary_scores = scores.detach().clone()
+        selected = top_budget_mask(
+            ordinary_scores, valid_mask.bool(), float(fraction)
+        ).detach().clone()
+        if weighting == "binary":
+            return selected.float()
+
+        flat_selected = selected.reshape(-1)
+        selected_indices = torch.nonzero(flat_selected, as_tuple=False).squeeze(-1)
+        count = int(selected_indices.numel())
+        if count == 0:
+            raise ValueError("Top-g_t selection produced no tokens")
+        selected_scores = torch.nan_to_num(
+            ordinary_scores.reshape(-1)[selected_indices], nan=-torch.inf
+        )
+        descending_order = torch.argsort(
+            selected_scores, descending=True, stable=True
+        )
+        if count == 1:
+            ranked_weights = torch.ones(
+                1, dtype=torch.float32, device=scores.device
+            ) * ((minimum + maximum) / 2.0)
+        else:
+            ranked_weights = torch.linspace(
+                maximum,
+                minimum,
+                steps=count,
+                dtype=torch.float32,
+                device=scores.device,
+            )
+        selected_weights = torch.empty_like(ranked_weights)
+        selected_weights[descending_order] = ranked_weights
+        result = torch.zeros(
+            flat_selected.shape, dtype=torch.float32, device=scores.device
+        )
+        result[selected_indices] = selected_weights
+        return result.reshape_as(scores)
 
 
 def uniform_weights(valid_mask: torch.Tensor) -> torch.Tensor:

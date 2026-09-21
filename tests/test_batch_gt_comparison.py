@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from analysis.batch_gt_comparison import (
@@ -26,6 +27,36 @@ def test_top_gt_weights_select_exact_batch_global_ceiling_with_stable_ties():
     assert int(weights.sum()) == math.ceil(0.30 * int(valid.sum())) == 3
     # Stable flatten-index tie breaking keeps position 1 before position 2.
     assert weights.tolist() == [[1.0, 1.0, 1.0, 0.0], [0.0, 0.0, 0.0, 0.0]]
+
+
+def test_top_gt_bounded_rank_weights_ignore_raw_magnitude_and_preserve_mass():
+    scores = torch.tensor([[1000.0, 10.0, 9.0, 8.0, 7.0]])
+    valid = torch.ones_like(scores, dtype=torch.bool)
+    weights = top_gt_weights(
+        scores,
+        valid,
+        fraction=0.60,
+        weighting="bounded_rank",
+        minimum=0.5,
+        maximum=1.5,
+    )
+    assert weights.tolist() == [[1.5, 1.0, 0.5, 0.0, 0.0]]
+    selected = weights[weights > 0]
+    assert selected.mean().item() == 1.0
+    assert selected.max().item() / selected.min().item() == 3.0
+
+
+def test_top_gt_bounded_rank_rejects_invalid_bounds():
+    scores = torch.tensor([[1.0]])
+    valid = torch.tensor([[True]])
+    with pytest.raises(ValueError, match="0 < minimum"):
+        top_gt_weights(
+            scores,
+            valid,
+            weighting="bounded_rank",
+            minimum=0.0,
+            maximum=1.0,
+        )
 
 
 def test_effective_weight_and_weighted_loss_match_selected_token_mean():
