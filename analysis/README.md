@@ -93,10 +93,10 @@ bash analysis/run_batch_gt_comparison.sh \
   --set batch_gt_comparison.output_dir=outputs/gt_exp_02
 ```
 
-Run on eight GPUs. Each rank keeps identical replicas of both training
-trajectories, while the exact Competition-MATH test KL is split into eight
-disjoint shards and reduced across ranks. Rank 0 alone writes outputs and
-checkpoints:
+Run on eight GPUs. Rank 0 alone owns both AdamW optimizers and applies the two
+training updates. It then broadcasts the exact post-update student weights to
+the other ranks; the Competition-MATH test KL is split into eight disjoint
+shards and reduced across ranks. Rank 0 alone writes outputs and checkpoints:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 \

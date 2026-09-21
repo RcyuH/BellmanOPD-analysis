@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import yaml
 
 from b200_experiment.config import apply_overrides, load_config, resolve_runtime_paths, save_config
@@ -210,32 +211,25 @@ def _distributed_pair_teacher_distance(
     )
 
 
-def _assert_replicated_training_results(
-    distributed: DistributedContext,
-    top_gt: dict[str, Any],
-    uniform: dict[str, Any],
-) -> None:
-    """Fail before evaluation if supposedly identical rank replicas diverged."""
+@torch.no_grad()
+def _broadcast_model_state(model, distributed: DistributedContext) -> None:
+    """Make rank 0 the sole weight authority before sharded evaluation.
+
+    Running independent fused-AdamW updates on nominally identical replicas can
+    drift across devices after several steps. Broadcasting every parameter and
+    buffer makes the evaluated model mathematically unambiguous: all test
+    shards always see rank 0's exact post-update weights.
+    """
     if not distributed.enabled:
         return
-    for branch, result in (("top_gt", top_gt), ("uniform", uniform)):
-        for key in ("loss", "gradient_l2_norm_before_clip"):
-            value = float(result[key])
-            maximum = distributed.max_float(value)
-            mean = distributed.mean_float(value)
-            if not math.isclose(maximum, mean, rel_tol=1e-6, abs_tol=1e-8):
-                raise RuntimeError(
-                    f"Replicated {branch} training diverged across ranks for {key}: "
-                    f"local={value}, global_mean={mean}, global_max={maximum}"
-                )
-        for key in ("selected_tokens", "valid_tokens"):
-            value = int(result[key])
-            maximum = distributed.max_int(value)
-            total = distributed.sum_int(value)
-            if maximum != value or total != value * distributed.world_size:
-                raise RuntimeError(
-                    f"Replicated {branch} training saw inconsistent {key} across ranks"
-                )
+    for parameter in model.parameters():
+        if parameter.device != distributed.device:
+            raise RuntimeError("Student parameters must be on the local CUDA device")
+        dist.broadcast(parameter.data, src=0)
+    for buffer in model.buffers():
+        if buffer.device != distributed.device:
+            raise RuntimeError("Student buffers must be on the local CUDA device")
+        dist.broadcast(buffer.data, src=0)
 
 
 def _save_pair(g_model, uniform_model, tokenizer, root: Path, step: int, final: bool) -> None:
@@ -328,8 +322,9 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     )
     device = distributed.device
     seed = int(config.get("experiment", {}).get("seed", 42))
-    # Every rank deliberately runs the same two training updates. The expensive
-    # held-out KL calculation, which dominates this experiment, is sharded.
+    # Rank 0 owns both optimizers and is the sole weight authority. The
+    # expensive held-out KL calculation, which dominates this experiment, is
+    # sharded across every rank after exact weight broadcasts.
     _seed(seed)
     output = Path(settings.get("output_dir", "outputs/batch_gt_comparison")).expanduser().resolve()
     output_is_nonempty = output.exists() and any(output.iterdir())
@@ -344,8 +339,10 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
     uniform_model, _uniform_tokenizer, _uniform_metadata = load_student_model(config, device)
     del _uniform_tokenizer, _uniform_metadata
     _assert_identical_initial_students(g_model, uniform_model)
-    g_optimizer = _adamw(g_model, config)
-    uniform_optimizer = _adamw(uniform_model, config)
+    _broadcast_model_state(g_model, distributed)
+    _broadcast_model_state(uniform_model, distributed)
+    g_optimizer = _adamw(g_model, config) if distributed.is_main else None
+    uniform_optimizer = _adamw(uniform_model, config) if distributed.is_main else None
 
     records, train_files = read_records(config["data"]["path"], config["data"].get("split"))
     validate_prompt_records(records, config["data"])
@@ -405,13 +402,16 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
         },
         "distributed": {
             "world_size": distributed.world_size,
-            "training": "identical replicated trajectories on every rank",
+            "training": (
+                "rank 0 owns both AdamW trajectories; exact post-update student "
+                "parameters and buffers are broadcast before every sharded evaluation"
+            ),
             "test_kl": (
                 "contiguous Competition-MATH shards reduced across ranks; both "
                 "students share each teacher forward"
             ),
             "writer_rank": 0,
-            "replica_consistency_check": "loss, gradient norm, and token counts every batch",
+            "weight_authority_rank": 0,
             "before_distance_reuse": (
                 "step t KL_before equals cached step t-1 KL_after because no update "
                 "occurs between batches"
@@ -458,73 +458,95 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
             g_before = g_before_cache
             uniform_before = uniform_before_cache
 
-        g_reference, g_scores, g_diagnostics = build_prompt_pgt_reference(
-            g_model,
-            teacher,
-            encoded["input_ids"],
-            encoded["attention_mask"],
-            student_temperature=float(config.get("rollout", {}).get("temperature", 1.0)),
-            teacher_temperature=float(config.get("opd", {}).get("teacher_temperature", 1.0)),
-            token_chunk_size=int(config.get("selector", {}).get("pgt_vocab_chunk_tokens", 2048)),
-        )
-        g_token_weights = top_gt_weights(
-            g_scores,
-            encoded["attention_mask"],
-            float(settings.get("token_fraction", 0.10)),
-        )
-        uniform_token_weights = uniform_weights(encoded["attention_mask"])
-        uniform_reference = build_prompt_opd_reference(
-            uniform_model,
-            teacher,
-            encoded["input_ids"],
-            encoded["attention_mask"],
-            student_temperature=float(config.get("rollout", {}).get("temperature", 1.0)),
-            teacher_temperature=float(config.get("opd", {}).get("teacher_temperature", 1.0)),
-        )
-        common_train_kwargs = {
-            "student_temperature": float(config.get("rollout", {}).get("temperature", 1.0)),
-            "clip_low": float(training.get("ppo_clip_low", 0.2)),
-            "clip_high": float(training.get("ppo_clip_high", 0.28)),
-            "dual_clip": float(training.get("ppo_dual_clip", 3.0)),
-            "chunk_steps": int(config.get("selector", {}).get("score_chunk_steps", 128)),
-            "max_grad_norm": float(training.get("max_grad_norm", 1.0)),
-        }
-        # Match any dropout/stochastic-layer randomness across the two updates.
-        # (Qwen defaults to zero dropout, but keeping this invariant makes the
-        # comparison valid for other compatible student checkpoints too.)
-        cpu_rng_state = torch.get_rng_state()
-        cuda_rng_state = torch.cuda.get_rng_state(device)
-        g_train = train_prompt_batch(
-            g_model,
-            g_optimizer,
-            encoded["input_ids"],
-            encoded["attention_mask"],
-            g_reference,
-            g_token_weights,
-            **common_train_kwargs,
-        )
-        torch.set_rng_state(cpu_rng_state)
-        torch.cuda.set_rng_state(cuda_rng_state, device)
-        uniform_train = train_prompt_batch(
-            uniform_model,
-            uniform_optimizer,
-            encoded["input_ids"],
-            encoded["attention_mask"],
-            uniform_reference,
-            uniform_token_weights,
-            **common_train_kwargs,
-        )
-        expected_selected = math.ceil(
-            float(settings.get("token_fraction", 0.10)) * g_train["valid_tokens"]
-        )
-        if g_train["selected_tokens"] != expected_selected:
-            raise AssertionError(
-                f"Expected exactly {expected_selected} top-g_t tokens, got "
-                f"{g_train['selected_tokens']}"
+        if distributed.is_main:
+            if g_optimizer is None or uniform_optimizer is None:
+                raise AssertionError("Rank 0 must own both optimizers")
+            g_reference, g_scores, g_diagnostics = build_prompt_pgt_reference(
+                g_model,
+                teacher,
+                encoded["input_ids"],
+                encoded["attention_mask"],
+                student_temperature=float(
+                    config.get("rollout", {}).get("temperature", 1.0)
+                ),
+                teacher_temperature=float(
+                    config.get("opd", {}).get("teacher_temperature", 1.0)
+                ),
+                token_chunk_size=int(
+                    config.get("selector", {}).get("pgt_vocab_chunk_tokens", 2048)
+                ),
             )
-        if uniform_train["selected_tokens"] != uniform_train["valid_tokens"]:
-            raise AssertionError("Uniform OPD did not train on every valid batch token")
-        _assert_replicated_training_results(distributed, g_train, uniform_train)
+            g_token_weights = top_gt_weights(
+                g_scores,
+                encoded["attention_mask"],
+                float(settings.get("token_fraction", 0.10)),
+            )
+            uniform_token_weights = uniform_weights(encoded["attention_mask"])
+            uniform_reference = build_prompt_opd_reference(
+                uniform_model,
+                teacher,
+                encoded["input_ids"],
+                encoded["attention_mask"],
+                student_temperature=float(
+                    config.get("rollout", {}).get("temperature", 1.0)
+                ),
+                teacher_temperature=float(
+                    config.get("opd", {}).get("teacher_temperature", 1.0)
+                ),
+            )
+            common_train_kwargs = {
+                "student_temperature": float(
+                    config.get("rollout", {}).get("temperature", 1.0)
+                ),
+                "clip_low": float(training.get("ppo_clip_low", 0.2)),
+                "clip_high": float(training.get("ppo_clip_high", 0.28)),
+                "dual_clip": float(training.get("ppo_dual_clip", 3.0)),
+                "chunk_steps": int(
+                    config.get("selector", {}).get("score_chunk_steps", 128)
+                ),
+                "max_grad_norm": float(training.get("max_grad_norm", 1.0)),
+            }
+            # Match dropout/stochastic-layer randomness across both updates.
+            cpu_rng_state = torch.get_rng_state()
+            cuda_rng_state = torch.cuda.get_rng_state(device)
+            g_train = train_prompt_batch(
+                g_model,
+                g_optimizer,
+                encoded["input_ids"],
+                encoded["attention_mask"],
+                g_reference,
+                g_token_weights,
+                **common_train_kwargs,
+            )
+            torch.set_rng_state(cpu_rng_state)
+            torch.cuda.set_rng_state(cuda_rng_state, device)
+            uniform_train = train_prompt_batch(
+                uniform_model,
+                uniform_optimizer,
+                encoded["input_ids"],
+                encoded["attention_mask"],
+                uniform_reference,
+                uniform_token_weights,
+                **common_train_kwargs,
+            )
+            expected_selected = math.ceil(
+                float(settings.get("token_fraction", 0.10))
+                * g_train["valid_tokens"]
+            )
+            if g_train["selected_tokens"] != expected_selected:
+                raise AssertionError(
+                    f"Expected exactly {expected_selected} top-g_t tokens, got "
+                    f"{g_train['selected_tokens']}"
+                )
+            if uniform_train["selected_tokens"] != uniform_train["valid_tokens"]:
+                raise AssertionError(
+                    "Uniform OPD did not train on every valid batch token"
+                )
+
+        # Only rank 0 mutates weights. Every evaluation worker receives those
+        # exact parameters before it scores its disjoint Competition-MATH shard.
+        _broadcast_model_state(g_model, distributed)
+        _broadcast_model_state(uniform_model, distributed)
         g_after, uniform_after = _distributed_pair_teacher_distance(
             g_model,
             uniform_model,
@@ -536,45 +558,52 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
         )
         g_before_cache = g_after
         uniform_before_cache = uniform_after
-        g_change = improvement_record(float(g_before["value"]), float(g_after["value"]))
-        uniform_change = improvement_record(
-            float(uniform_before["value"]), float(uniform_after["value"])
-        )
-        summary = {
-            "schema_version": SCHEMA_VERSION,
-            "optimizer_step_before": step,
-            "optimizer_step_after": step + 1,
-            "epoch": step // steps_per_epoch,
-            "batch_indices": batch_indices,
-            "sample_ids": sample_ids,
-            "valid_tokens": g_train["valid_tokens"],
-            "top_gt_selected_tokens": g_train["selected_tokens"],
-            "top_gt_selected_fraction": g_train["selected_tokens"] / g_train["valid_tokens"],
-            "top_gt_loss": g_train["loss"],
-            "uniform_loss": uniform_train["loss"],
-            "top_gt_gradient_l2_norm_before_clip": g_train["gradient_l2_norm_before_clip"],
-            "uniform_gradient_l2_norm_before_clip": uniform_train["gradient_l2_norm_before_clip"],
-            "top_gt": g_change,
-            "uniform": uniform_change,
-            "improvement_advantage_top_gt_minus_uniform": (
-                g_change["distance_improvement"] - uniform_change["distance_improvement"]
-            ),
-            "top_gt_wins_this_batch": (
-                g_change["distance_improvement"] > uniform_change["distance_improvement"]
-            ),
-            "student_weight_l2_distance_after_batch": (
-                model_parameter_l2_distance(g_model, uniform_model)
-                if distributed.is_main
-                else None
-            ),
-            "distance_num_test_problems": int(g_before["num_problems"]),
-            "distance_num_test_tokens": int(g_before["num_tokens"]),
-            "elapsed_seconds": time.time() - step_started,
-        }
-        g_per_token_loss = g_train.pop("per_token_loss")
-        uniform_per_token_loss = uniform_train.pop("per_token_loss")
-        token_rows = None
         if distributed.is_main:
+            g_change = improvement_record(
+                float(g_before["value"]), float(g_after["value"])
+            )
+            uniform_change = improvement_record(
+                float(uniform_before["value"]), float(uniform_after["value"])
+            )
+            summary = {
+                "schema_version": SCHEMA_VERSION,
+                "optimizer_step_before": step,
+                "optimizer_step_after": step + 1,
+                "epoch": step // steps_per_epoch,
+                "batch_indices": batch_indices,
+                "sample_ids": sample_ids,
+                "valid_tokens": g_train["valid_tokens"],
+                "top_gt_selected_tokens": g_train["selected_tokens"],
+                "top_gt_selected_fraction": (
+                    g_train["selected_tokens"] / g_train["valid_tokens"]
+                ),
+                "top_gt_loss": g_train["loss"],
+                "uniform_loss": uniform_train["loss"],
+                "top_gt_gradient_l2_norm_before_clip": g_train[
+                    "gradient_l2_norm_before_clip"
+                ],
+                "uniform_gradient_l2_norm_before_clip": uniform_train[
+                    "gradient_l2_norm_before_clip"
+                ],
+                "top_gt": g_change,
+                "uniform": uniform_change,
+                "improvement_advantage_top_gt_minus_uniform": (
+                    g_change["distance_improvement"]
+                    - uniform_change["distance_improvement"]
+                ),
+                "top_gt_wins_this_batch": (
+                    g_change["distance_improvement"]
+                    > uniform_change["distance_improvement"]
+                ),
+                "student_weight_l2_distance_after_batch": (
+                    model_parameter_l2_distance(g_model, uniform_model)
+                ),
+                "distance_num_test_problems": int(g_before["num_problems"]),
+                "distance_num_test_tokens": int(g_before["num_tokens"]),
+                "elapsed_seconds": time.time() - step_started,
+            }
+            g_per_token_loss = g_train.pop("per_token_loss")
+            uniform_per_token_loss = uniform_train.pop("per_token_loss")
             token_rows = _token_rows(
                 tokenizer,
                 encoded,
@@ -599,24 +628,23 @@ def run(config: dict[str, Any]) -> dict[str, Any]:
                     "rendered_prompts": rendered_prompts,
                 },
             )
+            print(json.dumps(summary, ensure_ascii=False), flush=True)
+            del (
+                g_reference,
+                uniform_reference,
+                g_scores,
+                g_diagnostics,
+                g_token_weights,
+                uniform_token_weights,
+                token_rows,
+                g_per_token_loss,
+                uniform_per_token_loss,
+            )
         if checkpoint_interval > 0 and (step + 1) % checkpoint_interval == 0:
             if distributed.is_main:
                 _save_pair(g_model, uniform_model, tokenizer, output, step + 1, False)
             distributed.barrier()
-        if distributed.is_main:
-            print(json.dumps(summary, ensure_ascii=False), flush=True)
-        del (
-            encoded,
-            g_reference,
-            uniform_reference,
-            g_scores,
-            g_diagnostics,
-            g_token_weights,
-            uniform_token_weights,
-            token_rows,
-            g_per_token_loss,
-            uniform_per_token_loss,
-        )
+        del encoded
     if distributed.is_main:
         _save_pair(g_model, uniform_model, tokenizer, output, total_steps, True)
     distributed.barrier()
@@ -658,9 +686,13 @@ def main() -> None:
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     args = parser.parse_args()
     config = resolve_runtime_paths(apply_overrides(load_config(args.config), args.set))
-    result = run(config)
-    if int(os.environ.get("RANK", "0")) == 0:
-        print(yaml.safe_dump(result, sort_keys=False, allow_unicode=True))
+    try:
+        result = run(config)
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(yaml.safe_dump(result, sort_keys=False, allow_unicode=True))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

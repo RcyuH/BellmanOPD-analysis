@@ -12,7 +12,10 @@ from analysis.batch_gt_comparison import (
     train_prompt_batch,
     weighted_loss,
 )
-from analysis.run_batch_gt_comparison import _distributed_pair_teacher_distance
+from analysis.run_batch_gt_comparison import (
+    _broadcast_model_state,
+    _distributed_pair_teacher_distance,
+)
 from analysis.summarize_batch_gt_comparison import summarize
 
 
@@ -90,6 +93,34 @@ class _SingleRankContext:
     @staticmethod
     def max_int(value):
         return int(value)
+
+
+class _BroadcastContext:
+    enabled = True
+    device = torch.device("cpu")
+
+
+class _ModelWithBuffer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+        self.register_buffer("counter", torch.tensor([2.0]))
+
+
+def test_weight_authority_broadcasts_parameters_and_buffers(monkeypatch):
+    calls = []
+
+    def fake_broadcast(tensor, src):
+        calls.append((tensor.detach().clone(), src))
+
+    monkeypatch.setattr(
+        "analysis.run_batch_gt_comparison.dist.broadcast", fake_broadcast
+    )
+    _broadcast_model_state(_ModelWithBuffer(), _BroadcastContext())
+    assert len(calls) == 2
+    assert [source for _, source in calls] == [0, 0]
+    assert torch.equal(calls[0][0], torch.tensor([1.0]))
+    assert torch.equal(calls[1][0], torch.tensor([2.0]))
 
 
 class _EvalModel:
